@@ -97,13 +97,16 @@ library pages once):
 
 | | idle | playing |
 | --- | --- | --- |
-| `apple-musicd` (Python) | 29 MB, 0.02% CPU | 30 MB, 0.1% CPU |
+| `apple-musicd` (Python) | 29 MB, 0.02% CPU | 30–54 MB, 0.1% CPU |
 | `mpv` | 39 MB, 0.05% CPU | 56 MB, 1.6% CPU |
 
-The window is QML inside the shell, so it adds no process of its own. There is
-one daemon and at most one mpv: a lock stops a second daemon, mpv dies with
-its parent even on `SIGKILL`, and an idle mpv is released after five minutes
-and started again for the next track. No Electron, no Chromium, no Node.
+The window is QML inside the shell, so it adds no process of its own. The
+daemon's upper figure is after the first track has been built: importing
+pywidevine and its protobuf/openssl stack is what maps the extra pages, and
+they stay warm for the next track. There is one daemon and at most one mpv: a
+lock stops a second daemon, mpv dies with its parent even on `SIGKILL`, and an
+idle mpv is released after five minutes and started again for the next track.
+No Electron, no Chromium, no Node.
 
 ## Sign-in
 
