@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hominluo.apple-music",
+  "name": "Apple Music",
+  "version": "0.1.0",
+  "author": "Homin Luo",
+  "license": "MIT",
+  "homepage": "https://github.com/hominluo/omarchy-apple-music",
+  "description": "Native Apple Music player for the Omarchy shell: catalog and library browsing, local Widevine decryption, mpv playback, no browser at runtime.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "overlay"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "overlay": "Browser.qml"
+  },
+  "barWidget": {
+    "displayName": "Apple Music",
+    "description": "Browse your Apple Music library and play it through mpv. Click the icon to open the browser.",
+    "category": "Media",
+    "aliases": [
+      "apple",
+      "music",
+      "applemusic"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showTitle": true,
+      "maxLabelWidth": 220
+    }
+  }
+}

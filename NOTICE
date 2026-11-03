@@ -1,0 +1,28 @@
+Apple Music for Omarchy — third-party notices
+=============================================
+
+pywidevine (https://github.com/devine-dl/pywidevine)
+    GPL-3.0-only. Installed into a private venv on first run and imported by
+    the daemon for the Widevine licence exchange. Because it is imported
+    in-process, a distributed binary that includes it is GPL-3.0 as a whole;
+    the plugin's own sources remain MIT.
+
+pycryptodome (https://www.pycryptodome.org)
+    BSD-2-Clause / public domain. Pulled in by pywidevine.
+
+pymp4, protobuf
+    Apache-2.0 and BSD-3-Clause. Pulled in by pywidevine.
+
+Widevine device file (engine/device.wvd)
+    Not part of this repository and not covered by its licence. A Widevine L3
+    CDM is bound to the device it was extracted from and is redistributed at
+    the user's own risk; supply your own with APPLE_MUSIC_WVD.
+
+mpv, ffmpeg, mpv-mpris
+    Separate programs invoked at runtime (GPL/LGPL as per their own licences);
+    nothing from them is linked into this plugin.
+
+Apple Music
+    Apple Music and the Apple logo are trademarks of Apple Inc. This plugin is
+    unaffiliated with Apple. It talks to the same web endpoints a browser does
+    and needs an Apple Music subscription to play anything.
