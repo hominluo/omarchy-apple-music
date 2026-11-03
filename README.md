@@ -78,6 +78,33 @@ Then add **Apple Music** from the bar widget picker. The daemon starts with the
 service; `omarchy-shell io.github.hominluo.apple-music ping` answers `pong`
 once it is up.
 
+## Remove
+
+```sh
+rm ~/.config/omarchy/plugins/io.github.hominluo.apple-music   # the symlink
+rm -rf ~/.local/share/omarchy-apple-music ~/.cache/omarchy/apple-music
+omarchy restart shell
+```
+
+The daemon and mpv exit with the service; `pkill -f apple-musicd` is the
+fallback if the shell was killed on top of them. Settings, cache and the
+sign-in profile live only in the two directories above.
+
+## Footprint
+
+Measured on this laptop with a 1920×1080 shell (PSS, which counts shared
+library pages once):
+
+| | idle | playing |
+| --- | --- | --- |
+| `apple-musicd` (Python) | 29 MB, 0.02% CPU | 30 MB, 0.1% CPU |
+| `mpv` | 39 MB, 0.05% CPU | 56 MB, 1.6% CPU |
+
+The window is QML inside the shell, so it adds no process of its own. There is
+one daemon and at most one mpv: a lock stops a second daemon, mpv dies with
+its parent even on `SIGKILL`, and an idle mpv is released after five minutes
+and started again for the next track. No Electron, no Chromium, no Node.
+
 ## Sign-in
 
 Signing in is a real window, not a token field. The plugin opens

@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import sys
 import time
 
@@ -71,8 +72,17 @@ def cmd_serve(args) -> int:
     daemon = Daemon()
 
     async def run():
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        # A shell restart sends SIGTERM. Without this the daemon dies inside
+        # its event loop and mpv is reparented instead of stopped.
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except (NotImplementedError, RuntimeError):
+                pass
         try:
-            await daemon.serve()
+            await daemon.serve(stop)
         finally:
             await daemon.shutdown()
 

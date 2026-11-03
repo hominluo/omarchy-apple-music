@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "id": "io.github.hominluo.apple-music",
   "name": "Apple Music",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Homin Luo",
   "license": "MIT",
   "homepage": "https://github.com/hominluo/omarchy-apple-music",
-  "description": "Native Apple Music player for the Omarchy shell: catalog and library browsing, local Widevine decryption, mpv playback, no browser at runtime.",
+  "description": "Native Apple Music for the Omarchy shell: browse the catalogue and your library, decrypt Widevine locally, and play 256 kbps AAC through mpv. A now-playing dropdown in the bar, a full window, no Electron or browser at runtime.",
   "kinds": [
     "service",
     "bar-widget",
@@ -19,12 +19,15 @@
   },
   "barWidget": {
     "displayName": "Apple Music",
-    "description": "Now-playing dropdown with seek, transport, volume and Up Next. Right-click the icon to browse the catalogue and your library.",
+    "description": "Now-playing dropdown with seek, transport, volume and Up Next. Right-click the icon for the full window: Home, Browse, Search, your library and the queue.",
     "category": "Media",
     "aliases": [
       "apple",
       "music",
-      "applemusic"
+      "applemusic",
+      "apple music",
+      "cider",
+      "itunes"
     ],
     "allowMultiple": false,
     "defaultSection": "right",

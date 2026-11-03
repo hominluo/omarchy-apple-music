@@ -10,6 +10,7 @@ Shuffling rewrites the part of the queue that has not played yet, so
 """
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -76,6 +77,7 @@ class Daemon:
         self._auth_task: asyncio.Task | None = None
         self._advancing = False
         self._failures = 0
+        self._lock = None
         self.ready = False
 
     # -- wiring -----------------------------------------------------------
@@ -562,13 +564,19 @@ class Daemon:
         except (ConnectionResetError, BrokenPipeError):
             pass
 
-    async def serve(self) -> None:
+    async def serve(self, stop: asyncio.Event | None = None) -> None:
         path = config.socket_path()
-        for stale in (path, Path(str(path) + ".lock")):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
+        lock = self._take_lock(path)
+        if lock is None:
+            log.info("another daemon already owns %s", path)
+            return
+        self._lock = lock
+        # Only the socket goes: the lock file is the inode another daemon's
+        # flock is held on, so unlinking it would hand out a second lock.
+        try:
+            path.unlink()
+        except OSError:
+            pass
         pid_path = path.parent / "daemon.pid"
         pid_path.write_text(f"{os.getpid()}\n", "utf-8")
         await self.startup()
@@ -577,7 +585,30 @@ class Daemon:
         log.info("listening on %s", path)
         await self.broadcast("snapshot", self.snapshot())
         async with server:
-            await server.serve_forever()
+            if stop is None:
+                await server.serve_forever()
+                return
+            serving = asyncio.create_task(server.serve_forever())
+            stopping = asyncio.create_task(stop.wait())
+            try:
+                await asyncio.wait({serving, stopping}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (serving, stopping):
+                    task.cancel()
+
+    def _take_lock(self, path: Path):
+        """One daemon per session: the shell can respawn while the old one is
+        still closing, and two daemons mean two mpv processes and two MPRIS
+        players both fighting over one socket path."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = Path(str(path) + ".lock")
+        handle = open(lock_path, "a+")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return None
+        return handle
 
     async def shutdown(self) -> None:
         for task in list(self.tasks):

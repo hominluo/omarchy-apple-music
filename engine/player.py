@@ -8,16 +8,29 @@ downloaded cannot stall the one that is playing.
 """
 
 import asyncio
+import ctypes
 import json
 import logging
 import os
 import random
 import shutil
+import signal
 import time
+from pathlib import Path
 
 from . import config
 
 log = logging.getLogger("apple-music.player")
+
+PR_SET_PDEATHSIG = 1
+# mpv is kept alive while a queue exists so the next track starts instantly.
+# With nothing queued it is just 40 MB of idle process, so it is released.
+IDLE_EXIT_SECONDS = 300
+
+try:
+    _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+except OSError:  # pragma: no cover - glibc is the target, musl names it libc.so
+    _LIBC = None
 
 MPRIS_PATHS = (
     "/usr/lib/mpv-mpris/mpris.so",
@@ -32,6 +45,58 @@ def mpris_script() -> str | None:
         if os.path.exists(path):
             return path
     return None
+
+
+def _die_with_parent() -> None:
+    """Run in the child before exec: SIGTERM mpv when the daemon dies.
+
+    Without this, a daemon that is killed (SIGTERM from a shell restart, or a
+    crash) leaves its idle mpv behind, reparented to systemd --user, holding
+    memory, an MPRIS player and the IPC socket for the next daemon to trip on.
+    """
+    try:
+        if _LIBC is not None:
+            _LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _stale_players(socket_path: str) -> list[int]:
+    """PIDs of mpv processes pointed at our socket but not started by us."""
+    needle = f"--input-ipc-server={socket_path}".encode()
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            cmdline = Path(f"/proc/{entry}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if needle in cmdline:
+            pids.append(int(entry))
+    return pids
+
+
+def _reap_stale_players(socket_path: str) -> None:
+    """A daemon restart used to leave the previous mpv running forever."""
+    pids = _stale_players(socket_path)
+    if not pids:
+        return
+    log.info("stopping %d orphaned mpv process(es)", len(pids))
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(20):
+        if not _stale_players(socket_path):
+            return
+        time.sleep(0.05)
+    for pid in _stale_players(socket_path):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 class Player:
@@ -60,6 +125,8 @@ class Player:
         self._had_media = False
         self._volume = 100
         self._starting = None
+        self.idle_exit_seconds = IDLE_EXIT_SECONDS
+        self._idle_since = None
 
     # -- lifecycle --------------------------------------------------------
     async def start(self):
@@ -69,6 +136,7 @@ class Player:
         if not mpv:
             raise RuntimeError("mpv is not installed")
         self.socket_path = str(config.runtime_dir() / "mpv.sock")
+        _reap_stale_players(self.socket_path)
         try:
             os.unlink(self.socket_path)
         except OSError:
@@ -81,6 +149,10 @@ class Player:
             "--no-terminal",
             "--really-quiet",
             "--audio-client-name=AppleMusic",
+            # The daemon hands mpv local decrypted files, so there is nothing
+            # to buffer: mpv's default 64 MiB demuxer cache is pure RSS here.
+            "--cache=no",
+            "--audio-display=no",
             f"--input-ipc-server={self.socket_path}",
             f"--volume={self._volume}",
         ]
@@ -90,6 +162,7 @@ class Player:
         log.info("starting mpv on %s", self.socket_path)
         self.proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            preexec_fn=_die_with_parent,
         )
         for _ in range(200):
             if os.path.exists(self.socket_path):
@@ -200,7 +273,16 @@ class Player:
         while True:
             try:
                 await asyncio.sleep(0.5)
-                if self.state["idle"] or not self.writer:
+                if self.state["idle"]:
+                    # Nothing is queued. Give the idle process back after a
+                    # while; ensure() starts a fresh mpv for the next track.
+                    if self._idle_since is None:
+                        self._idle_since = time.monotonic()
+                    elif time.monotonic() - self._idle_since >= self.idle_exit_seconds:
+                        await self._release()
+                    continue
+                self._idle_since = None
+                if not self.writer:
                     continue
                 response = await self._command(["get_property", "time-pos"], timeout=2)
                 if response and response.get("error") == "success":
@@ -214,6 +296,31 @@ class Player:
                 raise
             except Exception as error:  # noqa: BLE001 - polling must survive
                 log.debug("poll failed: %s", error)
+
+    async def _release(self):
+        """Stop the idle mpv. `ensure` starts another one when it is needed."""
+        if not self.proc or self.proc.returncode is not None:
+            return
+        self._idle_since = time.monotonic()
+        log.info("mpv idle for %ds; releasing it", self.idle_exit_seconds)
+        if self.read_task:
+            self.read_task.cancel()
+            self.read_task = None
+        if self.writer:
+            try:
+                self.writer.close()
+            except OSError:
+                pass
+        self.reader = self.writer = None
+        proc, self.proc = self.proc, None
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), 3)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
 
     async def _finish(self):
         self.state["pos"] = 0
