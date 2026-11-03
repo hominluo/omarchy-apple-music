@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.hominluo.apple-music",
   "name": "Apple Music",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Homin Luo",
   "license": "MIT",
   "homepage": "https://github.com/hominluo/omarchy-apple-music",
@@ -19,7 +19,7 @@
   },
   "barWidget": {
     "displayName": "Apple Music",
-    "description": "Browse your Apple Music library and play it through mpv. Click the icon to open the browser.",
+    "description": "Now-playing dropdown with seek, transport, volume and Up Next. Right-click the icon to browse the catalogue and your library.",
     "category": "Media",
     "aliases": [
       "apple",
@@ -30,7 +30,37 @@
     "defaultSection": "right",
     "defaults": {
       "showTitle": true,
-      "maxLabelWidth": 220
-    }
+      "maxLabelWidth": 120,
+      "wheelAction": "volume"
+    },
+    "schema": [
+      {
+        "key": "showTitle",
+        "type": "boolean",
+        "label": "Show the track title in the bar",
+        "defaultValue": true
+      },
+      {
+        "key": "maxLabelWidth",
+        "type": "integer",
+        "label": "Bar title width",
+        "min": 0,
+        "max": 400,
+        "step": 10,
+        "defaultValue": 120,
+        "description": "In the shell's spacing units. Longer titles scroll; 0 hides the title and leaves the icon."
+      },
+      {
+        "key": "wheelAction",
+        "type": "enum",
+        "label": "Scroll wheel on the bar icon",
+        "options": [
+          "volume",
+          "seek",
+          "none"
+        ],
+        "defaultValue": "volume"
+      }
+    ]
   }
 }

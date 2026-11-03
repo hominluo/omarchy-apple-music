@@ -450,6 +450,15 @@ class Daemon:
         await self.player.seek(float(params.get("pos") or 0))
         return self.player.snapshot()
 
+    async def cmd_jump(self, params: dict) -> dict:
+        if not self.queue:
+            raise ApiError("Nothing is queued", code="bad-request")
+        index = int(params.get("index") if params.get("index") is not None else 0)
+        self.index = max(0, min(index, len(self.queue) - 1))
+        await self._emit_state("queue", "nowPlaying")
+        await self._play_current()
+        return {"index": self.index}
+
     async def cmd_volume(self, params: dict) -> dict:
         value = int(params.get("value") if params.get("value") is not None else self.volume)
         await self.player.set_volume(value)

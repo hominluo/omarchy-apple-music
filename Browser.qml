@@ -52,7 +52,7 @@ Item {
   readonly property int cardWidth: Math.min(Style.space(1180), Math.round(panel.width * 0.86))
   readonly property int cardHeight: Math.min(Style.space(780), Math.round(panel.height * 0.86))
   readonly property int sidebarWidth: Style.space(184)
-  readonly property int footerHeight: Style.space(92)
+  readonly property int footerHeight: Style.space(96)
 
   // ---- service shortcuts -------------------------------------------------
   readonly property bool connected: service ? service.connected : false
@@ -187,7 +187,16 @@ Item {
     root.editing = item.editing === true
   }
 
-  onServiceChanged: if (viewLoader.item) viewLoader.item.service = root.service
+  onServiceChanged: {
+    if (!viewLoader.item) return
+    var hadService = viewLoader.item.service !== null
+    viewLoader.item.service = root.service
+    // The overlay can be created before the host has injected the service.
+    // The view loaded without one and its first load went nowhere, so ask it
+    // to load again now that there is something to talk to.
+    if (!hadService && root.service && typeof viewLoader.item.activated === "function")
+      Qt.callLater(viewLoader.item.activated)
+  }
 
   Connections {
     target: root.service
@@ -269,7 +278,7 @@ Item {
 
               Rectangle {
                 visible: root.history.length > 0
-                width: Style.space(28)
+                width: Style.space(32)
                 height: width
                 radius: width / 2
                 color: backArea.hovered ? Util.alpha(root.foreground, 0.10) : "transparent"
@@ -392,7 +401,7 @@ Item {
                 Rectangle {
                   id: sidebarRow
                   width: parent.width
-                  height: Style.space(32)
+                  height: Style.space(36)
                   radius: Math.min(Style.cornerRadius, Style.spacing.sm)
                   color: root.isSidebarActive(modelData) ? Util.alpha(root.accent, 0.16)
                        : (sidebarRow.hovered ? Util.alpha(root.foreground, 0.06) : "transparent")
@@ -487,103 +496,69 @@ Item {
             RowLayout {
               anchors.fill: parent
               anchors.margins: Style.spacing.md
-              spacing: Style.spacing.md
+              spacing: Style.spacing.lg
 
-              Cover {
+              // Left and right share one width, so the transport in the
+              // middle is the centre of the card, not the leftover space.
+              RowLayout {
+                Layout.preferredWidth: Style.space(236)
+                Layout.maximumWidth: Style.space(236)
                 Layout.alignment: Qt.AlignVCenter
-                size: Style.space(56)
-                source: root.hasSong ? String(root.nowPlaying.artwork || "") : ""
-                foreground: root.foreground
-                accent: root.accent
-              }
+                spacing: Style.spacing.sm
 
-              // Title block: shrinks before the transport does, so a narrow
-              // window never pushes the transport past the card edge.
-              Column {
-                Layout.alignment: Qt.AlignVCenter
-                Layout.preferredWidth: Style.space(190)
-                Layout.minimumWidth: Style.space(110)
-                Layout.maximumWidth: Style.space(260)
-                spacing: 1
-
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: root.hasSong ? String(root.nowPlaying.title || "") : "Nothing playing"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.weight: Font.DemiBold
-                  renderType: Text.NativeRendering
-                  elide: Text.ElideRight
+                Cover {
+                  Layout.alignment: Qt.AlignVCenter
+                  size: Style.space(52)
+                  source: root.hasSong ? String(root.nowPlaying.artwork || "") : ""
+                  foreground: root.foreground
+                  accent: root.accent
                 }
 
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: root.hasSong ? String(root.nowPlaying.artist || "") : "Pick something from Browse or Search"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  renderType: Text.NativeRendering
-                  elide: Text.ElideRight
+                Column {
+                  Layout.fillWidth: true
+                  Layout.alignment: Qt.AlignVCenter
+                  spacing: 1
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: root.hasSong ? String(root.nowPlaying.title || "") : "Nothing playing"
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.weight: Font.DemiBold
+                    renderType: Text.NativeRendering
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: root.hasSong ? String(root.nowPlaying.artist || "") : "Pick something from Browse or Search"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    renderType: Text.NativeRendering
+                    elide: Text.ElideRight
+                  }
                 }
               }
 
               // transport + progress
               Column {
                 Layout.fillWidth: true
-                Layout.minimumWidth: Style.space(200)
+                Layout.minimumWidth: Style.space(280)
                 Layout.alignment: Qt.AlignVCenter
                 spacing: Style.spacing.xs
 
-                Row {
+                TransportRow {
                   anchors.horizontalCenter: parent.horizontalCenter
-                  spacing: Style.spacing.lg
-
-                  Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    textFormat: Text.PlainText
-                    text: "󰒔"
-                    color: root.hasSong ? root.foreground : root.faint
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.title
-                    renderType: Text.NativeRendering
-                    HoverHandler { cursorShape: Qt.PointingHandCursor }
-                    TapHandler { onTapped: if (root.service) root.service.previous() }
-                  }
-
-                  Rectangle {
-                    width: Style.space(34)
-                    height: width
-                    radius: width / 2
-                    color: root.hasSong ? root.accent : Util.alpha(root.foreground, 0.15)
-
-                    Text {
-                      anchors.centerIn: parent
-                      textFormat: Text.PlainText
-                      text: root.service && root.service.playing ? "󰏤" : "󰐊"
-                      color: root.hasSong ? root.background : root.faint
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.title
-                      renderType: Text.NativeRendering
-                    }
-
-                    HoverHandler { cursorShape: Qt.PointingHandCursor }
-                    TapHandler { onTapped: if (root.service) root.service.toggle() }
-                  }
-
-                  Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    textFormat: Text.PlainText
-                    text: "󰒭"
-                    color: root.hasSong ? root.foreground : root.faint
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.title
-                    renderType: Text.NativeRendering
-                    HoverHandler { cursorShape: Qt.PointingHandCursor }
-                    TapHandler { onTapped: if (root.service) root.service.next() }
-                  }
+                  service: root.service
+                  foreground: root.foreground
+                  accent: root.accent
+                  background: root.background
+                  fontFamily: root.fontFamily
+                  large: true
                 }
 
                 RowLayout {
@@ -623,57 +598,74 @@ Item {
                 }
               }
 
-              // shuffle / repeat / volume
+              // volume + queue
               Column {
+                Layout.preferredWidth: Style.space(236)
+                Layout.maximumWidth: Style.space(236)
                 Layout.alignment: Qt.AlignVCenter
-                Layout.preferredWidth: Style.space(150)
-                Layout.minimumWidth: Style.space(96)
-                Layout.maximumWidth: Style.space(150)
                 spacing: Style.spacing.sm
 
-                Row {
-                  spacing: Style.spacing.md
-                  anchors.horizontalCenter: parent.horizontalCenter
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.spacing.xs
 
                   Text {
                     textFormat: Text.PlainText
-                    text: "󰒝"
-                    color: root.queue && root.queue.shuffle ? root.accent : root.faint
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.body
-                    renderType: Text.NativeRendering
-                    HoverHandler { cursorShape: Qt.PointingHandCursor }
-                    TapHandler { onTapped: if (root.service) root.service.setShuffle(!(root.queue && root.queue.shuffle)) }
-                  }
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: root.queue && root.queue.repeat === "one" ? "󰑘" : "󰑖"
-                    color: root.queue && root.queue.repeat !== "off" ? root.accent : root.faint
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.body
-                    renderType: Text.NativeRendering
-                    HoverHandler { cursorShape: Qt.PointingHandCursor }
-                    TapHandler { onTapped: if (root.service) root.service.cycleRepeat() }
-                  }
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: "󰕾"
+                    text: root.service && Number(root.service.player.volume) === 0 ? "󰖁" : "󰕾"
                     color: root.dim
                     font.family: Style.font.family
                     font.pixelSize: Style.font.body
                     renderType: Text.NativeRendering
+                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                    TapHandler {
+                      onTapped: {
+                        if (!root.service) return
+                        var current = Number(root.service.player.volume) || 0
+                        root.service.setVolume(current > 0 ? 0 : 70)
+                      }
+                    }
+                  }
+
+                  SeekBar {
+                    Layout.fillWidth: true
+                    foreground: root.foreground
+                    accent: root.accent
+                    position: root.service ? Number(root.service.player.volume) || 0 : 0
+                    duration: 100
+                    onSeeked: function(position) { if (root.service) root.service.setVolume(Math.round(position)) }
+                  }
+
+                  Text {
+                    Layout.preferredWidth: Style.space(30)
+                    horizontalAlignment: Text.AlignRight
+                    textFormat: Text.PlainText
+                    text: root.service ? Math.round(Number(root.service.player.volume) || 0) + "%" : ""
+                    color: root.faint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    renderType: Text.NativeRendering
                   }
                 }
 
-                SeekBar {
+                Item {
                   width: parent.width
-                  foreground: root.foreground
-                  accent: root.accent
-                  position: root.service ? Number(root.service.player.volume) || 0 : 0
-                  duration: 100
-                  onSeeked: function(position) { if (root.service) root.service.setVolume(Math.round(position)) }
+                  implicitHeight: queueButton.height
+
+                  Button {
+                    id: queueButton
+                    anchors.right: parent.right
+                    height: Style.space(26)
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.bodySmall
+                    iconText: "󰐑"
+                    iconSize: Style.font.bodySmall
+                    text: "Up Next" + (root.service && root.service.queueItems.length > 0
+                                        ? "  " + String(root.service.queueItems.length) : "")
+                    tooltipText: "The playback queue  (q)"
+                    bordered: true
+                    onClicked: root.navigate("queue", {}, true)
+                  }
                 }
               }
             }

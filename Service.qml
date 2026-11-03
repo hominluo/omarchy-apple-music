@@ -290,6 +290,7 @@ Item {
   function pause() { root.request("pause", {}) }
   function next() { root.request("next", {}) }
   function previous() { root.request("previous", {}) }
+  function jump(index) { root.request("jump", { index: index }) }
   function seek(pos) { root.request("seek", { pos: pos }) }
   function setVolume(value) { root.request("volume", { value: value }) }
   function setShuffle(on) { root.request("shuffle", { on: on }) }

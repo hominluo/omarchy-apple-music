@@ -1,14 +1,33 @@
 # Apple Music for Omarchy
 
 A native Apple Music player for the [Omarchy](https://omarchy.org) shell — catalog
-and library browsing in the bar and a full-window browser, with playback through
-mpv. No Electron, no browser at runtime.
+and library browsing in a full window, pause/skip/seek right under the bar icon,
+and playback through mpv. No Electron, no browser at runtime.
 
 The web player (Cider and friends) is a browser wrapped around MusicKit: it works,
 but it costs half a gigabyte of memory and a second Chrome to play a song. Apple
 serves the same 256 kbps AAC stream to Chrome as Widevine; decrypting it locally
 lets mpv do the playing, which is smaller, seekable, cacheable and already speaks
 MPRIS.
+
+![Apple Music playing in the Omarchy shell](preview.png)
+
+## Using the bar icon
+
+The bar cell is a now-playing dropdown, not just a launcher:
+
+- **Left click** — seek, transport, volume and Up Next without opening the
+  window. Hover or Tab into a row and Enter acts on it; `m` mutes, `n`/`p` skip,
+  `,`/`.` seek, `o` opens the window.
+- **Right click** — the full window: Home, Browse, Search, your library, the
+  queue, and sign-in.
+- **Middle click** — play/pause.
+- **Wheel** — volume, or seek, per the `wheelAction` setting.
+
+![The now-playing dropdown under the bar icon](docs/dropdown.png)
+
+The bar title is capped by `maxLabelWidth` (120 by default, in the shell's
+spacing units) and longer titles scroll; set it to `0` to leave only the glyph.
 
 ## Shape
 
@@ -86,9 +105,9 @@ $XDG_CACHE_HOME/omarchy/apple-music/   audio/, artwork/, engine.log
 ```
 
 `settings.json` holds `storefront`, `language`, `codec`, `prefetch` (tracks
-resolved ahead) and `cacheLimitMb` (default 1024). Old audio is pruned when
-the cache is over the limit; the daemon never deletes the track that is
-playing.
+resolved ahead), `cacheLimitMb` (default 1024) and `volume` (0–130, the level
+the player comes back at). Old audio is pruned when the cache is over the limit;
+the daemon never deletes the track that is playing.
 
 ## IPC
 
