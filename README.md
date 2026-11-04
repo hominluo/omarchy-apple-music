@@ -29,6 +29,10 @@ The bar cell is a now-playing dropdown, not just a launcher:
 The bar title is capped by `maxLabelWidth` (120 by default, in the shell's
 spacing units) and longer titles scroll; set it to `0` to leave only the glyph.
 
+In the window, the cover in the footer opens the album that is playing and the
+artist line opens the artist, so a song heard somewhere can be followed back to
+its record without a search.
+
 ## Shape
 
 - **Plugin** (`io.github.hominluo.apple-music`), kinds `service`, `bar-widget`

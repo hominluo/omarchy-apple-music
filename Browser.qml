@@ -149,6 +149,30 @@ Item {
     Qt.callLater(root.refocus)
   }
 
+  // ---- footer links ------------------------------------------------------
+  // The daemon resolves these ids for the current track (see `_lookup`); the
+  // footer only offers the link when it has one.
+  readonly property string nowAlbumId: root.nowPlaying ? String(root.nowPlaying.albumId || "") : ""
+  readonly property string nowArtistId: root.nowPlaying ? String(root.nowPlaying.artistId || "") : ""
+
+  function openNowAlbum() {
+    if (root.nowAlbumId === "") return
+    root.navigate("album", {
+      id: root.nowAlbumId,
+      library: root.nowPlaying.albumLibrary === true,
+      title: String(root.nowPlaying.album || "")
+    })
+  }
+
+  function openNowArtist() {
+    if (root.nowArtistId === "") return
+    root.navigate("artist", {
+      id: root.nowArtistId,
+      library: root.nowPlaying.artistLibrary === true,
+      title: String(root.nowPlaying.artist || "")
+    })
+  }
+
   function refocus() {
     if (!root.opened) return
     var item = viewLoader.item
@@ -512,6 +536,26 @@ Item {
                   source: root.hasSong ? String(root.nowPlaying.artwork || "") : ""
                   foreground: root.foreground
                   accent: root.accent
+
+                  // The cover leads to the album it belongs to.
+                  MouseArea {
+                    id: coverLink
+                    anchors.fill: parent
+                    enabled: root.nowAlbumId !== ""
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    hoverEnabled: enabled
+
+                    Rectangle {
+                      anchors.fill: parent
+                      radius: coverLink.parent.radius
+                      color: root.accent
+                      opacity: coverLink.containsMouse ? 0.18 : 0
+                      visible: opacity > 0
+                      Behavior on opacity { NumberAnimation { duration: 120 } }
+                    }
+
+                    onClicked: root.openNowAlbum()
+                  }
                 }
 
                 Column {
@@ -531,15 +575,34 @@ Item {
                     elide: Text.ElideRight
                   }
 
-                  Text {
+                  Item {
                     width: parent.width
-                    textFormat: Text.PlainText
-                    text: root.hasSong ? String(root.nowPlaying.artist || "") : "Pick something from Browse or Search"
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    renderType: Text.NativeRendering
-                    elide: Text.ElideRight
+                    height: artistText.height
+
+                    Text {
+                      id: artistText
+                      width: parent.width
+                      textFormat: Text.PlainText
+                      text: root.hasSong ? String(root.nowPlaying.artist || "") : "Pick something from Browse or Search"
+                      color: artistLink.containsMouse ? root.accent : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.underline: artistLink.containsMouse
+                      renderType: Text.NativeRendering
+                      elide: Text.ElideRight
+
+                      Behavior on color { ColorAnimation { duration: 120 } }
+                    }
+
+                    // The artist line leads to the artist.
+                    MouseArea {
+                      id: artistLink
+                      anchors.fill: parent
+                      enabled: root.nowArtistId !== ""
+                      cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                      hoverEnabled: enabled
+                      onClicked: root.openNowArtist()
+                    }
                   }
                 }
               }

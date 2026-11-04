@@ -88,7 +88,7 @@ Item {
                          : Style.font.iconLarge
         iconText: {
           if (modelData === "shuffle") return "󰒝"
-          if (modelData === "previous") return "󰒔"
+          if (modelData === "previous") return "󰒮"
           if (modelData === "playPause") return root.playing ? "󰏤" : "󰐊"
           if (modelData === "next") return "󰒭"
           return root.repeatMode === "one" ? "󰑘" : "󰑖"

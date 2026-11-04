@@ -74,6 +74,8 @@ class Daemon:
         self.build_state: dict = {}
         self._build_task: asyncio.Task | None = None
         self._prefetch_task: asyncio.Task | None = None
+        self._lookup_task: asyncio.Task | None = None
+        self._related: dict[str, dict] = {}
         self._auth_task: asyncio.Task | None = None
         self._advancing = False
         self._failures = 0
@@ -231,9 +233,70 @@ class Daemon:
             await self.player.stop()
             await self._emit_state("nowPlaying")
             return
+        self._lookup(song)
         self._build_task = asyncio.create_task(self._start_track(song))
         self.tasks.add(self._build_task)
         self._build_task.add_done_callback(self.tasks.discard)
+
+    # -- album / artist links ---------------------------------------------
+    def _lookup(self, song: dict) -> None:
+        """Find the album and artist the current song belongs to.
+
+        The footer links the cover to the album and the artist line to the
+        artist, so it needs both ids. A listing usually carries them already;
+        a queue handed over by a view, or a cached track, may not, and then
+        one lookup is worth it. The answer is cached per song for the session.
+        """
+        if not song or not self.api or not self.api.media_user_token:
+            return
+        if song.get("albumId") and song.get("artistId"):
+            return
+        song_id = str(song.get("id") or "")
+        if not song_id:
+            return
+        known = self._related.get(song_id)
+        if known is None:
+            if self._lookup_task:
+                self._lookup_task.cancel()
+            self._lookup_task = asyncio.create_task(self._fetch_related(song))
+            self.tasks.add(self._lookup_task)
+            self._lookup_task.add_done_callback(self.tasks.discard)
+            return
+        if known:
+            task = asyncio.create_task(self._patch_track(song_id, known))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+
+    async def _fetch_related(self, song: dict) -> None:
+        song_id = str(song.get("id") or "")
+        try:
+            info = await self.api.song(song_id, bool(song.get("library")))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - the link is cosmetic
+            log.debug("no album or artist for %s: %s", song_id, error)
+            self._related[song_id] = {}
+            return
+        patch = {key: info[key] for key in
+                 ("albumId", "albumLibrary", "artistId", "artistLibrary", "album", "artist")
+                 if info.get(key)}
+        if len(self._related) > 400:
+            self._related.clear()
+        self._related[song_id] = patch
+        await self._patch_track(song_id, patch)
+
+    async def _patch_track(self, song_id: str, patch: dict) -> None:
+        changed = False
+        for track in self.queue:
+            if str(track.get("id")) == song_id:
+                track.update(patch)
+                changed = True
+        if not changed:
+            return
+        current = self.now_playing()
+        if current and str(current.get("id")) == song_id:
+            await self._emit_state("nowPlaying")
+        await self._emit_state("queue")
 
     async def _start_track(self, song: dict) -> None:
         song_id = str(song["id"])
@@ -580,7 +643,11 @@ class Daemon:
         pid_path = path.parent / "daemon.pid"
         pid_path.write_text(f"{os.getpid()}\n", "utf-8")
         await self.startup()
-        server = await asyncio.start_unix_server(self.handle, path=str(path))
+        # A play command carries the whole queue, artwork URLs included: a
+        # 100-track handover is well past asyncio's 64 KiB readline default,
+        # and that used to close the connection mid-request.
+        server = await asyncio.start_unix_server(self.handle, path=str(path),
+                                                 limit=8 * 1024 * 1024)
         os.chmod(path, 0o600)
         log.info("listening on %s", path)
         await self.broadcast("snapshot", self.snapshot())

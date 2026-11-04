@@ -124,6 +124,20 @@ def brief(item: dict, kind: str | None = None) -> dict:
         "artwork": _art(attributes),
         "library": bool(item.get("_library")) or item_id.startswith("i."),
     }
+    # Where the cover and the artist name should lead. Only present when the
+    # request asked for the relationships (see `_RELATED`), so absence is
+    # normal and the UI has to cope with it.
+    relationships = item.get("relationships") or {}
+    for key, field in (("albums", "album"), ("artists", "artist")):
+        related = ((relationships.get(key) or {}).get("data") or [])
+        if not related:
+            continue
+        first = related[0] or {}
+        related_id = str(first.get("id") or "")
+        if related_id:
+            base[field + "Id"] = related_id
+            base[field + "Library"] = (related_id[:2] in ("l.", "r.")
+                                       or str(first.get("type") or "").startswith("library-"))
     if item_type in ("songs", "song", "library-songs"):
         base.update({
             "type": "song",
@@ -154,6 +168,12 @@ def brief(item: dict, kind: str | None = None) -> dict:
 
 def _with_library(items: list[dict], library: bool) -> list[dict]:
     return [brief(dict(item, _library=library)) for item in items if item.get("id")]
+
+
+# Songs are shown with a cover and an artist line that both lead somewhere;
+# asking for the relationships costs nothing extra and saves the daemon a
+# second round trip per track.
+_RELATED = "albums,artists"
 
 
 class AppleApi:
@@ -260,7 +280,8 @@ class AppleApi:
             return {"songs": [], "albums": [], "artists": [], "playlists": []}
         data = await self._get(
             f"/v1/catalog/{self.storefront}/search",
-            {"term": term, "types": kinds, "limit": limit, "l": self.language},
+            {"term": term, "types": kinds, "limit": limit, "l": self.language,
+             "include[songs]": _RELATED},
         )
         results = data.get("results") or {}
         return {
@@ -334,19 +355,21 @@ class AppleApi:
 
     async def library(self, kind: str = "songs", limit: int = 100, offset: int = 0) -> dict:
         kind = kind if kind in ("songs", "albums", "playlists", "artists") else "songs"
-        data = await self._get(
-            f"/v1/me/library/{kind}",
-            {"limit": limit, "offset": offset, "l": self.language},
-        )
+        params = {"limit": limit, "offset": offset, "l": self.language}
+        if kind == "songs":
+            params["include"] = _RELATED
+        data = await self._get(f"/v1/me/library/{kind}", params)
         items = _with_library(data.get("data") or [], True)
         return {"items": items, "next": data.get("next")}
 
     async def home(self) -> dict:
         sections = []
         tasks = [
-            ("recent", "/v1/me/recent/played/tracks", {"limit": 12, "l": self.language}),
+            ("recent", "/v1/me/recent/played/tracks",
+             {"limit": 12, "include": _RELATED, "l": self.language}),
             ("charts", f"/v1/catalog/{self.storefront}/charts",
-             {"types": "songs,albums", "limit": 12, "l": self.language}),
+             {"types": "songs,albums", "limit": 12, "include[songs]": _RELATED,
+              "l": self.language}),
         ]
         results = await asyncio.gather(
             *(self._get(uri, params) for _name, uri, params in tasks),
@@ -380,11 +403,12 @@ class AppleApi:
 
     async def song(self, song_id: str, library: bool = False) -> dict:
         if library:
-            data = await self._get(f"/v1/me/library/songs/{song_id}", {"l": self.language})
+            data = await self._get(f"/v1/me/library/songs/{song_id}",
+                                   {"include": _RELATED, "l": self.language})
         else:
             data = await self._get(
                 f"/v1/catalog/{self.storefront}/songs/{song_id}",
-                {"include": "albums", "l": self.language},
+                {"include": _RELATED, "l": self.language},
             )
         records = data.get("data") or []
         if not records:
