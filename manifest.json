@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.hominluo.apple-music",
   "name": "Apple Music",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": "Homin Luo",
   "license": "MIT",
   "homepage": "https://github.com/hominluo/omarchy-apple-music",
@@ -40,7 +40,8 @@
       {
         "key": "showTitle",
         "type": "boolean",
-        "label": "Show the track title in the bar",
+        "label": "Show the track title while playing",
+        "description": "The title appears while a track plays and leaves only the icon when paused, like the Podcast cell.",
         "defaultValue": true
       },
       {

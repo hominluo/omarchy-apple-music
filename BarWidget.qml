@@ -43,7 +43,9 @@ BarWidget {
   readonly property bool hasSong: service ? service.hasSong : false
   readonly property string trackTitle: service ? service.title : ""
   readonly property string trackArtist: service ? service.artist : ""
-  readonly property bool showTitle: setting("showTitle", true) === true && hasSong && trackTitle !== ""
+  // Like the Podcast cell: the title is a playing indicator, so a paused
+  // player leaves just the glyph in the bar.
+  readonly property bool showTitle: setting("showTitle", true) === true && hasSong && playing && trackTitle !== ""
   readonly property int maxLabelWidth: Style.space(setting("maxLabelWidth", 120))
   readonly property string wheelAction: String(setting("wheelAction", "volume"))
 
@@ -152,8 +154,8 @@ BarWidget {
         fontFamily: root.fontFamily
         fontSize: Style.bar.iconFont
         // The full bar foreground in every state: at bar size a dimmed glyph
-        // reads as a broken one next to its neighbours. Paused is already told
-        // by the title.
+        // reads as a broken one next to its neighbours. Paused is told by the
+        // title being gone.
         color: root.foreground
       }
 
