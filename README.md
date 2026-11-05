@@ -63,16 +63,39 @@ its record without a search.
 ## Requirements
 
 - Omarchy with Quickshell (the plugin targets the 0.3-era plugin API).
-- `ffmpeg`, `mpv` and `mpv-mpris`.
+- `ffmpeg`, `mpv` and `mpv-mpris` — all in Omarchy's base install.
 - Python 3.11+ (the daemon creates a private venv for `pywidevine` on first
   run; nothing is installed system-wide).
-- A browser for sign-in only: Chrome, Chromium, Brave or Edge.
+- A browser for sign-in only: Chromium (stock Omarchy), Chrome, Brave or Edge.
 - An Apple Music subscription.
-- A Widevine L3 device file (`.wvd`, see below).
+- A Widevine L3 device file (`.wvd`, see below). This is the one piece the
+  standard install cannot supply.
 
 ## Install
 
-The plugin is a directory the shell scans:
+```sh
+omarchy plugin add https://github.com/hominluo/omarchy-apple-music --enable
+```
+
+Add **Apple Music** from the widget picker if it is not in the bar yet. The
+daemon starts with the service; once it is up, this answers `pong`:
+
+```sh
+omarchy-shell io.github.hominluo.apple-music ping
+```
+
+### The one manual step: the Widevine device
+
+Drop an L3 `.wvd` into the installed plugin, or point `APPLE_MUSIC_WVD` at it:
+
+```sh
+cp device.wvd ~/.config/omarchy/plugins/io.github.hominluo.apple-music/engine/device.wvd
+```
+
+Everything else — the private venv, the sign-in browser profile, the caches —
+the daemon creates itself.
+
+### Local development
 
 ```sh
 git clone https://github.com/hominluo/omarchy-apple-music ~/Github/omarchy-apple-music
@@ -80,16 +103,11 @@ ln -s ~/Github/omarchy-apple-music ~/.config/omarchy/plugins/io.github.hominluo.
 omarchy restart shell
 ```
 
-Then add **Apple Music** from the bar widget picker. The daemon starts with the
-service; `omarchy-shell io.github.hominluo.apple-music ping` answers `pong`
-once it is up.
-
 ## Remove
 
 ```sh
-rm ~/.config/omarchy/plugins/io.github.hominluo.apple-music   # the symlink
+omarchy plugin remove io.github.hominluo.apple-music
 rm -rf ~/.local/share/omarchy-apple-music ~/.cache/omarchy/apple-music
-omarchy restart shell
 ```
 
 The daemon and mpv exit with the service; `pkill -f apple-musicd` is the
