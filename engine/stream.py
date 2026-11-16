@@ -341,8 +341,8 @@ class StreamBuilder:
             await result
 
     # -- resolve ----------------------------------------------------------
-    async def _playback(self, song_id: str, library: bool, codec: str) -> dict:
-        playback = await self.api.webplayback(song_id, library)
+    async def _playback(self, song_id: str, catalog_id: str, codec: str) -> dict:
+        playback = await self.api.webplayback(song_id, catalog_id)
         songs = playback.get("songList") or []
         if not songs:
             message = (playback.get("customerMessage")
@@ -358,14 +358,17 @@ class StreamBuilder:
         return {"url": asset["URL"], "trackId": songs[0].get("songId") or song_id,
                 "flavor": asset.get("flavor")}
 
-    async def resolve(self, song_id: str, library: bool = False, codec: str = "aac-web") -> HlsInfo:
+    async def resolve(self, song_id: str, catalog_id: str = "", codec: str = "aac-web") -> HlsInfo:
         """Read the playlist(s) down to the bytes and the licence URI.
+
+        `catalog_id` is the catalogue twin a library song names; some library
+        tracks only stream through it (see apple.playback_requests).
 
         The asset URL is usually the media playlist itself; when it is a
         master (it has EXT-X-STREAM-INF lines) the highest-bandwidth variant
         is followed. Both shapes end up in the same HlsInfo.
         """
-        playback = await self._playback(song_id, library, codec)
+        playback = await self._playback(song_id, catalog_id, codec)
         url = playback["url"]
         text = await asyncio.to_thread(lambda: _fetch(url).decode("utf-8", "ignore"))
         parsed = _parse_m3u8(text, url)
@@ -457,7 +460,7 @@ class StreamBuilder:
 
     async def _build_locked(self, song: dict, song_id: str, codec: str, target: Path) -> None:
         await self._progress(song_id, "resolving")
-        info = await self.resolve(song_id, bool(song.get("library")), codec)
+        info = await self.resolve(song_id, str(song.get("catalogId") or ""), codec)
 
         await self._progress(song_id, "downloading", total=len(info.segments))
         chunks = await self._download(info, song_id)

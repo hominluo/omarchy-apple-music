@@ -257,6 +257,105 @@ class Paging(ApiCase):
         self.assertIsNone(apple._next_offset(None, 40, 25))
 
 
+def song(song_id, kind="songs", **play_params):
+    return {"id": song_id, "type": kind,
+            "attributes": {"name": song_id, "playParams": {"id": song_id, **play_params}}}
+
+
+class LibraryOrCatalogue(ApiCase):
+    """0.3.2: Recently Played tagged every row as a library track, so every
+    one was asked for by a library id it does not have and Apple refused."""
+
+    def test_a_record_says_whose_copy_it_is(self):
+        self.assertFalse(apple.brief(song("1598272613"))["library"])
+        self.assertTrue(apple.brief(song("i.abc", "library-songs"))["library"])
+        self.assertTrue(apple.brief(song("a.123", "library-songs"))["library"])
+        self.assertFalse(apple.brief({"id": "pl.u-xyz", "type": "playlists"})["library"])
+        self.assertTrue(apple.brief({"id": "p.xyz", "type": "library-playlists"})["library"])
+
+    def test_a_library_song_carries_its_catalogue_twin(self):
+        self.assertEqual(
+            apple.brief(song("a.123", "library-songs", catalogId="123"))["catalogId"], "123")
+        self.assertNotIn("catalogId", apple.brief(song("1598272613")))
+
+    def test_recently_played_keeps_catalogue_songs_as_catalogue(self):
+        self.answer(
+            response(200, {"data": [song("i.abc", "library-songs", catalogId="77"),
+                                    song("1598272613")]}),
+            response(200, {"results": {}}),
+        )
+        home = asyncio.run(self.api.home())
+        recent = home["sections"][0]["items"]
+        self.assertEqual([(t["id"], t["library"]) for t in recent],
+                         [("i.abc", True), ("1598272613", False)])
+        asked = next(kwargs["params"] for _m, url, kwargs in self.calls
+                     if url.endswith("/recent/played/tracks"))
+        # Library plays are left out unless asked for by name, and this
+        # endpoint ignores the plain `include`.
+        self.assertEqual(asked["types"], "songs,library-songs")
+        self.assertIn("include[songs]", asked)
+        self.assertNotIn("include", asked)
+
+    def test_a_numeric_id_is_looked_up_in_the_catalogue(self):
+        self.answer(response(200, {"data": [song("1598272613")]}))
+        asyncio.run(self.api.song("1598272613", library=True))
+        self.assertIn("/v1/catalog/gb/songs/1598272613", self.calls[0][1])
+
+
+class Playback(ApiCase):
+    PLAYABLE = {"songList": [{"songId": "1", "assets": []}]}
+    DIALOG = {"dialog": {"explanation": "Not for you"}}
+
+    def asked(self):
+        return [{k: v for k, v in kwargs["json"].items() if k != "language"}
+                for _m, _url, kwargs in self.calls]
+
+    def test_the_id_decides_how_a_track_is_asked_for(self):
+        self.assertEqual(apple.playback_requests("1598272613"),
+                         [{"salableAdamId": "1598272613"}])
+        self.assertEqual(apple.playback_requests("i.abc", "77"),
+                         [{"universalLibraryId": "i.abc"}, {"salableAdamId": "77"}])
+        self.assertEqual(apple.playback_requests("a.123", "123"),
+                         [{"salableAdamId": "123"}, {"universalLibraryId": "a.123"}])
+        self.assertEqual(apple.playback_requests("i.upload"),
+                         [{"universalLibraryId": "i.upload"}])
+
+    def test_a_catalogue_song_is_never_asked_for_as_a_library_one(self):
+        self.answer(response(200, self.PLAYABLE))
+        asyncio.run(self.api.webplayback("1598272613"))
+        self.assertEqual(self.asked(), [{"salableAdamId": "1598272613"}])
+
+    def test_a_playlist_only_track_plays_through_its_catalogue_twin(self):
+        self.answer(response(200, self.PLAYABLE))
+        asyncio.run(self.api.webplayback("a.123", "123"))
+        self.assertEqual(self.asked(), [{"salableAdamId": "123"}])
+
+    def test_a_refused_library_id_falls_back_to_the_catalogue_twin(self):
+        self.answer(response(200, self.DIALOG), response(200, self.PLAYABLE))
+        data = asyncio.run(self.api.webplayback("i.abc", "77"))
+        self.assertTrue(data["songList"])
+        self.assertEqual(self.asked(), [{"universalLibraryId": "i.abc"}, {"salableAdamId": "77"}])
+
+    def test_the_first_refusal_is_the_one_reported(self):
+        self.answer(response(200, self.DIALOG), response(200, {"failureType": "3076"}))
+        with self.assertRaises(ApiError) as caught:
+            asyncio.run(self.api.webplayback("i.abc", "77"))
+        self.assertEqual(caught.exception.message, "Not for you")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_an_answer_without_a_dialog_goes_back_to_the_builder(self):
+        """The builder words that one itself, from customerMessage."""
+        self.answer(response(200, {"customerMessage": "Sold out"}))
+        self.assertEqual(asyncio.run(self.api.webplayback("1")), {"customerMessage": "Sold out"})
+
+    def test_a_dead_session_does_not_try_the_other_id(self):
+        self.answer(response(403))
+        with self.assertRaises(ApiError) as caught:
+            asyncio.run(self.api.webplayback("i.abc", "77"))
+        self.assertEqual(caught.exception.code, "unauthorized")
+        self.assertEqual(len(self.calls), 1)
+
+
 class Storefront(ApiCase):
     def test_the_account_sets_the_catalogue_storefront(self):
         self.answer(response(200, {"data": [], "meta": {"subscription": {"storefront": "JP"}}}))

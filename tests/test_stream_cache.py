@@ -244,6 +244,20 @@ class Build(CacheCase):
                          ["resolving", "downloading", "decrypting", "ready"])
         self.assertIn(path, stream._RECENT)
 
+    async def test_the_catalogue_twin_reaches_the_playback_lookup(self):
+        """0.3.2: a playlist-only library track streams only through it."""
+        builder = self.builder()
+        builder._decrypt = lambda source, target, key, song, cover=None: target.write_bytes(b"x")
+        await builder.build({"id": "a.123", "library": True, "catalogId": "123"})
+        builder.resolve.assert_awaited_once_with("a.123", "123", "aac-web")
+
+        api = mock.Mock()
+        api.webplayback = mock.AsyncMock(return_value={"songList": [{
+            "songId": "123", "assets": [{"flavor": "28:ctrp256", "URL": "https://x/a.m3u8"}]}]})
+        found = await StreamBuilder(api=api)._playback("a.123", "123", "aac-web")
+        api.webplayback.assert_awaited_once_with("a.123", "123")
+        self.assertEqual(found["trackId"], "123")
+
     async def test_failed_decrypt_leaves_nothing_behind(self):
         """F36: the .enc, the cover and the partial stayed in build/ forever."""
         builder = self.builder()

@@ -178,6 +178,41 @@ def _art(attributes: dict, size: int = 360) -> str:
     return config.artwork_url(artwork.get("url"), size)
 
 
+def in_library(item: dict) -> bool:
+    """Whether a record is the user's own copy rather than a catalogue entry.
+
+    The record says so itself, with a ``library-…`` type and an id in a
+    library namespace (``i.`` songs, ``l.`` albums, ``p.`` playlists, ``r.``
+    artists, ``a.`` playlist-only songs). The endpoint it came from does not:
+    /v1/me/recent/played/tracks is a /me endpoint that answers with catalogue
+    songs, and tagging those as library made every one of them unplayable.
+    """
+    if str(item.get("type") or "").startswith("library-"):
+        return True
+    return str(item.get("id") or "")[:2] in ("i.", "l.", "p.", "r.", "a.")
+
+
+def playback_requests(song_id: str, catalog_id: str = "") -> list[dict]:
+    """What to ask webPlayback for, best first. The id decides, not the page
+    the track was listed on:
+
+      - a catalogue id (all digits) is a ``salableAdamId``. Sent as a
+        ``universalLibraryId`` Apple answers with a dialog, which the UI
+        showed as "Apple Music will not stream this track";
+      - ``i.…`` is a saved track and a ``universalLibraryId``, as it always
+        was here; its catalogue twin is the fallback when Apple refuses that;
+      - any other library id (``a.…``, a playlist track that was never added
+        to the library) is refused as a ``universalLibraryId`` and only plays
+        through its catalogue twin, so that goes first.
+    """
+    song_id, catalog_id = str(song_id or ""), str(catalog_id or "")
+    if song_id.isdigit():
+        return [{"salableAdamId": song_id}]
+    own = {"universalLibraryId": song_id}
+    twin = [{"salableAdamId": catalog_id}] if catalog_id and catalog_id != song_id else []
+    return [own, *twin] if song_id.startswith("i.") else [*twin, own]
+
+
 def brief(item: dict, kind: str | None = None) -> dict:
     attributes = item.get("attributes") or {}
     item_type = kind or item.get("type") or ""
@@ -187,7 +222,7 @@ def brief(item: dict, kind: str | None = None) -> dict:
         "type": item_type,
         "title": attributes.get("name") or attributes.get("title") or "",
         "artwork": _art(attributes),
-        "library": bool(item.get("_library")) or item_id.startswith("i."),
+        "library": in_library(item),
     }
     # Where the cover and the artist name should lead. Only present when the
     # request asked for the relationships (see `_RELATED`), so absence is
@@ -213,6 +248,11 @@ def brief(item: dict, kind: str | None = None) -> dict:
             "trackNumber": int(attributes.get("trackNumber") or 0),
             "explicit": (attributes.get("contentRating") == "explicit"),
         })
+        # A library song names its catalogue twin; playback needs it for the
+        # tracks Apple will not stream by their library id.
+        catalog_id = str((attributes.get("playParams") or {}).get("catalogId") or "")
+        if catalog_id and catalog_id != item_id:
+            base["catalogId"] = catalog_id
     elif item_type in ("albums", "album", "library-albums"):
         base.update({
             "type": "album",
@@ -231,8 +271,8 @@ def brief(item: dict, kind: str | None = None) -> dict:
     return base
 
 
-def _with_library(items: list[dict], library: bool) -> list[dict]:
-    return [brief(dict(item, _library=library)) for item in items if item.get("id")]
+def _briefs(items: list[dict]) -> list[dict]:
+    return [brief(item) for item in items if item.get("id")]
 
 
 # Songs are shown with a cover and an artist line that both lead somewhere;
@@ -408,25 +448,25 @@ class AppleApi:
         )
         results = data.get("results") or {}
         return {
-            "songs": _with_library((results.get("songs") or {}).get("data") or [], False),
-            "albums": _with_library((results.get("albums") or {}).get("data") or [], False),
-            "artists": _with_library((results.get("artists") or {}).get("data") or [], False),
-            "playlists": _with_library((results.get("playlists") or {}).get("data") or [], False),
+            "songs": _briefs((results.get("songs") or {}).get("data") or []),
+            "albums": _briefs((results.get("albums") or {}).get("data") or []),
+            "artists": _briefs((results.get("artists") or {}).get("data") or []),
+            "playlists": _briefs((results.get("playlists") or {}).get("data") or []),
         }
 
-    async def _collection(self, uri: str, params: dict, library: bool) -> dict:
+    async def _collection(self, uri: str, params: dict) -> dict:
         data = await self._get(uri, params)
         records = data.get("data") or []
         if not records:
             raise ApiError("Not found", code="not-found")
         record = records[0]
-        info = brief(dict(record, _library=library))
+        info = brief(record)
         related = ((record.get("relationships") or {}).get("tracks") or {})
-        tracks = [brief(dict(t, _library=library)) for t in (related.get("data") or [])]
+        tracks = [brief(t) for t in (related.get("data") or [])]
         # Keep following the track pagination; a playlist can be huge.
         pages, truncated = await self._follow(related.get("next"), COLLECTION_PAGES)
         for page in pages:
-            tracks.extend(brief(dict(t, _library=library)) for t in page)
+            tracks.extend(brief(t) for t in page)
         for index, track in enumerate(tracks):
             track["index"] = index
         return {"info": info, "tracks": tracks, "truncated": truncated}
@@ -455,18 +495,18 @@ class AppleApi:
     async def album(self, album_id: str, library: bool = False) -> dict:
         if library:
             return await self._collection(
-                f"/v1/me/library/albums/{album_id}", {"include": "tracks"}, True)
+                f"/v1/me/library/albums/{album_id}", {"include": "tracks"})
         return await self._collection(
             f"/v1/catalog/{self.storefront}/albums/{album_id}",
-            {"include": "tracks", "limit[tracks]": 100, "l": self.language}, False)
+            {"include": "tracks", "limit[tracks]": 100, "l": self.language})
 
     async def playlist(self, playlist_id: str, library: bool = False) -> dict:
         if library:
             return await self._collection(
-                f"/v1/me/library/playlists/{playlist_id}", {"include": "tracks"}, True)
+                f"/v1/me/library/playlists/{playlist_id}", {"include": "tracks"})
         return await self._collection(
             f"/v1/catalog/{self.storefront}/playlists/{playlist_id}",
-            {"include": "tracks", "limit[tracks]": 100, "l": self.language}, False)
+            {"include": "tracks", "limit[tracks]": 100, "l": self.language})
 
     async def artist(self, artist_id: str, library: bool = False) -> dict:
         if library:
@@ -481,13 +521,13 @@ class AppleApi:
         if not records:
             raise ApiError("Artist not found", code="not-found")
         record = records[0]
-        info = brief(dict(record, _library=library))
+        info = brief(record)
         related = ((record.get("relationships") or {}).get("albums") or {})
         albums = list(related.get("data") or [])
         pages, truncated = await self._follow(related.get("next"), ARTIST_PAGES)
         for page in pages:
             albums.extend(page)
-        return {"info": info, "albums": _with_library(albums, library), "truncated": truncated}
+        return {"info": info, "albums": _briefs(albums), "truncated": truncated}
 
     async def library(self, kind: str = "songs", limit: int = 100, offset: int = 0) -> dict:
         """One page of the library: {items, next}, where `next` is the offset
@@ -503,14 +543,20 @@ class AppleApi:
             params["include"] = _RELATED
         data = await self._get(f"/v1/me/library/{kind}", params)
         records = data.get("data") or []
-        items = _with_library(records, True)
+        items = _briefs(records)
         return {"items": items, "next": _next_offset(data.get("next"), offset, len(records))}
 
     async def home(self) -> dict:
         sections = []
         tasks = [
+            # Both kinds, by name: without `types` Apple leaves out everything
+            # played from the library. And `include` per type: this endpoint
+            # ignores the plain `include`, which left the rows without the
+            # album and artist their cover and artist line lead to.
             ("recent", "/v1/me/recent/played/tracks",
-             {"limit": 12, "include": _RELATED, "l": self.language}),
+             {"limit": 12, "types": "songs,library-songs",
+              "include[songs]": _RELATED, "include[library-songs]": _RELATED,
+              "l": self.language}),
             ("charts", f"/v1/catalog/{self.storefront}/charts",
              {"types": "songs,albums", "limit": 12, "include[songs]": _RELATED,
               "l": self.language}),
@@ -524,7 +570,7 @@ class AppleApi:
                 log.debug("home section %s failed: %s", name, result)
                 continue
             if name == "recent":
-                items = _with_library(result.get("data") or [], True)
+                items = _briefs(result.get("data") or [])
                 if items:
                     sections.append({"title": "Recently Played", "kind": "songs", "items": items})
             else:
@@ -537,7 +583,7 @@ class AppleApi:
                             flat.append(entry)
                         else:
                             flat.extend(entry.get("data") or [])
-                    items = _with_library(flat, False)
+                    items = _briefs(flat)
                     if items:
                         sections.append({
                             "title": "Top " + ("Songs" if key == "songs" else "Albums"),
@@ -546,7 +592,8 @@ class AppleApi:
         return {"sections": sections}
 
     async def song(self, song_id: str, library: bool = False) -> dict:
-        if library:
+        # A numeric id is a catalogue id, whatever the caller was told.
+        if library and not str(song_id).isdigit():
             data = await self._get(f"/v1/me/library/songs/{song_id}",
                                    {"include": _RELATED, "l": self.language})
         else:
@@ -557,20 +604,28 @@ class AppleApi:
         records = data.get("data") or []
         if not records:
             raise ApiError("Song not found", code="not-found")
-        return brief(dict(records[0], _library=library))
+        return brief(records[0])
 
     # -- playback ---------------------------------------------------------
-    async def webplayback(self, song_id: str, library: bool = False) -> dict:
-        payload = {"universalLibraryId": song_id} if library else {"salableAdamId": song_id}
-        payload["language"] = self.language
-        data = await self._post(WEBPLAYBACK, payload)
-        if "dialog" in data:
+    async def webplayback(self, song_id: str, catalog_id: str = "") -> dict:
+        """The signed playlist for a track, asked for by the id it answers to
+        (see playback_requests). A refusal moves on to the next way of asking;
+        a transport error does not, it is raised by _post as it always was.
+        When every way is refused, the first refusal is the one reported."""
+        refused: dict | None = None
+        for payload in playback_requests(song_id, catalog_id):
+            data = await self._post(WEBPLAYBACK, {**payload, "language": self.language})
+            if data.get("songList"):
+                return data
+            refused = data if refused is None else refused
+        refused = refused or {}
+        if "dialog" in refused:
             raise ApiError(
-                (data.get("dialog") or {}).get("explanation")
+                (refused.get("dialog") or {}).get("explanation")
                 or "Apple Music will not stream this track",
                 code="unavailable",
             )
-        return data
+        return refused
 
     async def license(self, track_id: str, uri: str, challenge: str) -> dict:
         data = await self._post(LICENSE, {
