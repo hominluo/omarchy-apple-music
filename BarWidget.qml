@@ -86,7 +86,7 @@ BarWidget {
 
   function browse() {
     root.close()
-    if (root.service && typeof root.service.browse === "function") root.service.browse("")
+    if (root.service && typeof root.service.openWindow === "function") root.service.openWindow("")
     else if (root.bar && root.bar.shell && typeof root.bar.shell.summon === "function") root.bar.shell.summon(root.moduleName, "{}")
   }
 
@@ -131,6 +131,7 @@ BarWidget {
       if (!root.hasSong) return "Apple Music"
       var head = root.trackArtist + " — " + root.trackTitle
       if (service.prepareMessage !== "") return head + "\n" + service.prepareMessage
+      if (service.isLive) return head + "\nLIVE"
       return head + "\n" + root.formatTime(service.position) + " / " + root.formatTime(service.duration)
     }
 
@@ -147,8 +148,9 @@ BarWidget {
       button.wheelAcc = wheel.remainder
       if (wheel.steps === 0) return
       if (root.wheelAction === "seek") {
-        // A track still being prepared has nothing to seek in yet.
-        if (!root.service.canSeek) return
+        // A track still being prepared has nothing to seek in yet, and a
+        // live station has nothing to seek in at all.
+        if (!root.service.canSeek || root.service.isLive) return
         var target = Math.max(0, Math.min(root.service.duration || 0,
                                            root.service.position + wheel.steps * 10))
         root.service.seek(target)

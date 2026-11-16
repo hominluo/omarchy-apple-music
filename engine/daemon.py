@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 from pathlib import Path
@@ -22,6 +23,7 @@ from pathlib import Path
 from . import __version__, auth, config
 from .apple import ApiError, AppleApi, storefront_from_account, subscription_end
 from .player import Player, PlayerReset, clamp_volume
+from .radio import RadioProxy
 from .stream import StreamBuilder, sweep_work_dir
 
 log = logging.getLogger("apple-music.daemon")
@@ -29,7 +31,7 @@ log = logging.getLogger("apple-music.daemon")
 # Bumped whenever a command or a slice changes shape. The Service compares it
 # (and the engine version) on hello and replaces a daemon left over from an
 # older install, which would otherwise outlive any number of plugin updates.
-PROTOCOL = 2
+PROTOCOL = 3
 ENGINE_VERSION = __version__
 # How many tracks may fail in a row before automatic advance gives up. Without
 # this, a broken album (region lock, delisted tracks) would walk the whole queue.
@@ -51,7 +53,8 @@ ENABLED_POLL_SECONDS = 5.0
 # never holds up a pause, and a reply nobody can receive any more is dropped
 # when its connection closes.
 READ_COMMANDS = frozenset({"status", "home", "search", "album", "playlist", "artist",
-                           "library", "account", "cache"})
+                           "library", "account", "cache", "browse", "grouping", "room",
+                           "curator", "charts", "station", "lyrics", "rating"})
 # Commands that take no turn: quit must not queue behind a hung command,
 # sign-in waits on a browser launch and sign-out on the window closing.
 FREE_COMMANDS = frozenset({"quit", "signin", "signOut", "signout"})
@@ -60,7 +63,21 @@ FREE_COMMANDS = frozenset({"quit", "signin", "signOut", "signout"})
 # in flight would otherwise probe the account at once.
 VERIFY_INTERVAL = 30.0
 # play may look a song up first; it takes the command lock itself, after that.
-SELF_ORDERED = frozenset({"play"})
+# So do the station commands, which ask Apple for the station's first tracks,
+# and the library and rating writes, which only wait on Apple.
+SELF_ORDERED = frozenset({"play", "playStation", "createStation", "enqueue",
+                          "rate", "addToLibrary"})
+# A track station hands out songs in batches; the next batch is fetched when
+# this few are left after the playing one.
+STATION_REFILL_AT = 3
+STATION_BATCH = 10
+# Songs remembered per track station, so a batch that repeats one is skipped.
+STATION_SEEN_MAX = 500
+# How often the now-airing show of a live station is looked at again.
+SCHEDULE_TICK_SECONDS = 30.0
+# A live station paused for longer than this is tuned in again on resume, so
+# it plays what is on now (as the web player does), not what was on then.
+LIVE_RESUME_SECONDS = 60.0
 # Build failures that say nothing about the track itself. A prefetch that hits
 # one leaves the row alone instead of marking it unavailable.
 TRANSIENT_CODES = frozenset({"network", "unauthorized", "starting"})
@@ -88,6 +105,41 @@ def _subscription_state(account: dict | None) -> str:
     if status is None:
         return "unknown"
     return {"1": "subscribed", "2": "subscribed", "3": "expired"}.get(str(status), str(status))
+
+
+_IDENT = re.compile(r"[A-Za-z0-9._\-]{1,128}")
+
+
+def _ident(value, default=None) -> str:
+    """An Apple id from a request: catalogue digits, `l.`/`pl.`/`ra.` ids,
+    a station hash id. Anything else would end up in a URL path."""
+    text = str(value or "")
+    if _IDENT.fullmatch(text):
+        return text
+    if default is not None and not text:
+        return default
+    raise ApiError("Bad id", code="bad-request")
+
+
+def _parse_time(value: str) -> float | None:
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _event_now(event: dict, now: float) -> bool:
+    start, end = _parse_time(event.get("start", "")), _parse_time(event.get("end", ""))
+    return start is not None and end is not None and start <= now < end
+
+
+def _airing(schedule: list[dict], now: float) -> str:
+    for event in schedule:
+        if _event_now(event, now):
+            return str(event.get("title") or "")
+    return ""
 
 
 class Daemon:
@@ -155,6 +207,24 @@ class Daemon:
         self._failures = 0
         self._lock = None
         self.ready = False
+        # Live radio and episodes go to mpv through this loopback proxy.
+        self.radio = RadioProxy(lambda: self.api, lambda: self.builder)
+        # The task fetching the next batch of a track station (or Autoplay's
+        # continuation), and the songs a station has already handed out.
+        self._extend_task: asyncio.Task | None = None
+        self._station_seen: set[str] = set()
+        # The schedule of the live station playing, and the task that moves
+        # its subtitle to the next show when one starts.
+        self._schedule: list[dict] = []
+        self._schedule_task: asyncio.Task | None = None
+        # Bumped by every new queue, so a batch fetched for the old one is
+        # dropped instead of appended to the new one.
+        self._queue_gen = 0
+        # When a live stream last ended by itself, for the retune limit.
+        self._live_drops: list[float] = []
+        # (songId, when) of the last pause, however it was pressed (the
+        # window, the bar, a media key straight to mpv).
+        self._paused_since: tuple[str, float] | None = None
 
     # -- wiring -----------------------------------------------------------
     async def startup(self):
@@ -392,12 +462,39 @@ class Daemon:
 
     async def _player_changed(self, state: dict) -> None:
         await self.broadcast("player", state)
+        self._note_pause(state)
         # mpv comes and goes (idle release, crash, restart); the engine slice
         # follows it so the UI never reports a dead player as running.
         status = "running" if self.player.running else "stopped"
         if status != self._mpv_status:
             self._mpv_status = status
             await self._emit_state("engine")
+
+    def _note_pause(self, state: dict) -> None:
+        song_id = str(state.get("songId") or "")
+        if state.get("idle") or state.get("loading") or not song_id:
+            self._paused_since = None
+            return
+        if state.get("paused"):
+            if self._paused_since is None or self._paused_since[0] != song_id:
+                self._paused_since = (song_id, time.monotonic())
+            return
+        paused, self._paused_since = self._paused_since, None
+        if paused is None or paused[0] != song_id:
+            return
+        current = self.now_playing() or {}
+        if (str(current.get("id")) == song_id and current.get("type") == "station"
+                and current.get("live") and time.monotonic() - paused[1] > LIVE_RESUME_SECONDS):
+            task = asyncio.create_task(self._retune_live(song_id))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+
+    async def _retune_live(self, song_id: str) -> None:
+        async with self._command_lock:
+            current = self.now_playing() or {}
+            if str(current.get("id")) == song_id and not self._building():
+                log.info("live station %s resumed after a long pause; tuning in again", song_id)
+                await self._play_current()
 
     async def _player_exited(self, returncode) -> None:
         await self.broadcast("notice", {
@@ -487,6 +584,10 @@ class Daemon:
     async def _set_queue(self, tracks: list[dict], index: int, context: dict) -> None:
         self.queue = [t for t in tracks if t.get("id")]
         self.context = context or {}
+        self._queue_gen += 1
+        if self._extend_task is not None and not self._extend_task.done():
+            self._extend_task.cancel()
+        self._station_seen = {str(t.get("id")) for t in self.queue}
         self.index = max(0, min(index, len(self.queue) - 1)) if self.queue else -1
         if self.shuffle and self.queue:
             # A fresh queue has nothing played yet: the chosen track first,
@@ -595,6 +696,8 @@ class Daemon:
         """
         if not song or not self.api or not self.api.media_user_token:
             return
+        if song.get("type") == "station":
+            return
         if song.get("albumId") and song.get("artistId"):
             return
         song_id = str(song.get("id") or "")
@@ -676,8 +779,11 @@ class Daemon:
         try:
             if queued:
                 await self._publish_build()
-            path = await self.builder.build(song, codec=str(self.settings.get("codec") or "aac-web"))
-            await self.player.load(str(path), song_id, start=start)
+            if song.get("type") == "station":
+                await self._tune(song, song_id, start)
+            else:
+                path = await self.builder.build(song, codec=str(self.settings.get("codec") or "aac-web"))
+                await self.player.load(str(path), song_id, start=start)
             if self._build_task is asyncio.current_task():
                 # In mpv now: a click on its row restarts it again.
                 self._build_song = None
@@ -703,6 +809,7 @@ class Daemon:
             await self._release_build(song_id, succeeded=True)
             await self._emit_state("nowPlaying")
             self._schedule_prefetch()
+            self._maybe_extend()
             return
 
         # Any failure, not just the ones the API explains: a network error
@@ -755,7 +862,7 @@ class Daemon:
             if self._generation != generation:
                 return
             song_id = str(song.get("id") or "")
-            if not song_id:
+            if not song_id or song.get("type") == "station":
                 continue
             self._prefetching = song_id
             self._hold_build(song_id)
@@ -780,6 +887,14 @@ class Daemon:
 
     async def _advance(self, direction: int, automatic: bool = False) -> None:
         target = self._step(direction, automatic)
+        task = self._extend_task
+        if (target is None and automatic and direction > 0 and task is not None
+                and not task.done()):
+            # The last track ended while a station's next batch (or
+            # Autoplay's) was still on its way. Automatic advances never run
+            # under the command lock, so waiting here holds up nothing else.
+            await asyncio.wait({task}, timeout=10)
+            target = self._step(direction, automatic)
         if target is None:
             # Next on the last track while it is still downloading: without
             # this the build finished after the stop and started playing.
@@ -804,6 +919,17 @@ class Daemon:
     async def _track_finished(self) -> None:
         if self._advancing:
             return
+        current = self.now_playing()
+        if (current and current.get("type") == "station" and current.get("live")
+                and not self.player.state.get("loading")):
+            # A live stream has no end: it dropped. Tune in again, a few
+            # times a minute at most, rather than move on.
+            now = time.monotonic()
+            self._live_drops = [t for t in self._live_drops if now - t < 60] + [now]
+            if len(self._live_drops) <= 3:
+                log.info("live stream %s ended; tuning in again", current.get("id"))
+                await self._play_current(keep_pause=True)
+                return
         if self.player.state.get("loading"):
             # The old track ran out while the queue had already moved on and
             # the new one is still being prepared: it starts when it is ready.
@@ -814,6 +940,135 @@ class Daemon:
             await self._advance(1, automatic=True)
         finally:
             self._advancing = False
+
+    # -- radio --------------------------------------------------------------
+    async def _tune(self, station: dict, song_id: str, start: float) -> None:
+        """Start a stream station: live radio, an episode, a broadcaster."""
+        self.build_state[song_id] = {"songId": song_id, "stage": "resolving"}
+        await self._publish_build()
+        if not station.get("playParams"):
+            info = await self.api.station(song_id)
+            station.update({key: value for key, value in info["info"].items() if key != "id"})
+        url = await self.radio.tune(station)
+        title = str(station.get("title") or "Apple Music Radio")
+        await self.player.load(url, song_id, start=start if station.get("episode") else 0.0,
+                               stream_title=title)
+        if station.get("live"):
+            self._watch_schedule(dict(station))
+
+    def _watch_schedule(self, station: dict) -> None:
+        if self._schedule_task is not None and not self._schedule_task.done():
+            self._schedule_task.cancel()
+        self._schedule_task = asyncio.create_task(self._follow_schedule(station))
+        self.tasks.add(self._schedule_task)
+        self._schedule_task.add_done_callback(self.tasks.discard)
+
+    async def _follow_schedule(self, station: dict) -> None:
+        """Keep a live station's subtitle on the show that is airing, as the
+        web player's On Air line does. Broadcasters have no schedule; their
+        provider stays."""
+        station_id = str(station.get("id") or "")
+        try:
+            schedule = (await self.api.station(station_id))["schedule"]
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - the subtitle is cosmetic
+            log.debug("no schedule for %s: %s", station_id, error)
+            return
+        if not schedule:
+            return
+        while True:
+            current = self.now_playing()
+            if not current or str(current.get("id")) != station_id:
+                return
+            airing = _airing(schedule, time.time())
+            if airing and airing != current.get("artist"):
+                for track in self.queue:
+                    if str(track.get("id")) == station_id:
+                        track["artist"] = airing
+                        track["subtitle"] = f"LIVE · {airing}"
+                await self._emit_state("nowPlaying", "queue")
+            await asyncio.sleep(SCHEDULE_TICK_SECONDS)
+
+    def _maybe_extend(self) -> None:
+        """Fetch more music before the queue runs out: the next batch of a
+        track station, or, with Autoplay on, a station seeded from what just
+        played. Called whenever a track starts."""
+        if self._extend_task is not None and not self._extend_task.done():
+            return
+        if not self.queue or self.index < 0:
+            return
+        remaining = len(self.queue) - 1 - self.index
+        context = dict(self.context or {})
+        if context.get("type") == "station" and context.get("refill"):
+            if remaining >= STATION_REFILL_AT:
+                return
+        else:
+            current = self.now_playing() or {}
+            if (remaining > 0 or self.repeat != "off" or current.get("type") == "station"
+                    or not self.settings.get("autoplay", True)):
+                return
+        self._extend_task = asyncio.create_task(self._extend(context, self._queue_gen))
+        self.tasks.add(self._extend_task)
+        self._extend_task.add_done_callback(self.tasks.discard)
+
+    async def _extend(self, context: dict, queue_gen: int) -> None:
+        new_context = None
+        try:
+            api = await self._catalogue_api()
+            if not api.media_user_token:
+                return
+            if context.get("type") == "station" and context.get("refill"):
+                tracks = await api.station_tracks(str(context.get("id") or ""), STATION_BATCH)
+            else:
+                seeds = [t for t in self.queue[-5:] if t.get("type", "song") == "song"]
+                station, tracks = await api.continuous(seeds, STATION_BATCH)
+                new_context = {"type": "station", "id": station.get("id") or "",
+                               "title": "Autoplay", "artwork": station.get("artwork") or "",
+                               "refill": bool(station.get("id")), "autoplay": True}
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - the queue just ends where it is
+            log.info("could not fetch more music: %s", getattr(error, "message", "") or error)
+            return
+        if queue_gen != self._queue_gen:
+            return
+        fresh = []
+        for track in tracks:
+            track_id = str(track.get("id") or "")
+            if track_id and track_id not in self._station_seen:
+                self._station_seen.add(track_id)
+                fresh.append(track)
+        if len(self._station_seen) > STATION_SEEN_MAX:
+            self._station_seen = {str(t.get("id")) for t in self.queue[-STATION_SEEN_MAX // 2:]}
+        if not fresh:
+            return
+        self.queue.extend(fresh)
+        if new_context:
+            self.context = new_context
+        await self._emit_state("queue")
+        if not self._building():
+            # The new tracks may be inside the prefetch window already.
+            self._schedule_prefetch()
+
+    async def _start_station(self, api: AppleApi, station: dict) -> dict:
+        context = {"type": "station", "id": station.get("id") or "",
+                   "title": station.get("title") or "", "artwork": station.get("artwork") or ""}
+        if station.get("stream"):
+            item = {key: value for key, value in station.items()
+                    if key in ("id", "type", "title", "artwork", "artist", "subtitle", "live",
+                               "stream", "episode", "durationMs", "playParams", "description")}
+            item.update({"type": "station", "library": False, "playable": True})
+            async with self._command_lock:
+                await self._set_queue([item], 0, context)
+        else:
+            tracks = await api.station_tracks(str(station.get("id") or ""), STATION_BATCH)
+            if not tracks:
+                raise ApiError("This station has nothing to play right now", code="unavailable")
+            context["refill"] = True
+            async with self._command_lock:
+                await self._set_queue(tracks, 0, context)
+        return {"index": self.index, "count": len(self.queue), "station": station}
 
     # -- commands ---------------------------------------------------------
     async def cmd_status(self, params: dict) -> dict:
@@ -1045,6 +1300,125 @@ class Daemon:
         return await api.library(str(params.get("kind") or "songs"),
                                  int(params.get("limit") or 100), offset)
 
+    async def cmd_browse(self, params: dict) -> dict:
+        """Home, New or Radio: {title, sections}."""
+        page = str(params.get("page") or "home")
+        api = await self._catalogue_api()
+        if page == "home":
+            if not api.media_user_token:
+                raise ApiError("Sign in to Apple Music to see your recommendations",
+                               code="unauthorized")
+            return await api.listen_now()
+        if page == "new":
+            return await api.browse_page("music")
+        if page == "radio":
+            result = await api.browse_page("radio")
+            if api.media_user_token:
+                try:
+                    recent = await api.recent_stations()
+                except ApiError as error:
+                    if error.code == "unauthorized":
+                        raise
+                    recent = []
+                if recent:
+                    result["sections"].insert(0, {
+                        "id": "recent-stations", "title": "Recently Played", "kind": "cards",
+                        "items": recent, "seeAll": None})
+            return result
+        raise ApiError(f"Unknown page: {page}", code="bad-request")
+
+    async def cmd_grouping(self, params: dict) -> dict:
+        api = await self._catalogue_api()
+        return await api.grouping(_ident(params.get("id")))
+
+    async def cmd_room(self, params: dict) -> dict:
+        api = await self._catalogue_api()
+        try:
+            offset = max(0, int(params.get("offset") or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        return await api.room(_ident(params.get("id")), offset)
+
+    async def cmd_curator(self, params: dict) -> dict:
+        api = await self._catalogue_api()
+        return await api.curator(_ident(params.get("id")), str(params.get("kind") or "apple-curators"))
+
+    async def cmd_charts(self, params: dict) -> dict:
+        api = await self._catalogue_api()
+        return await api.charts()
+
+    async def cmd_station(self, params: dict) -> dict:
+        api = await self._catalogue_api()
+        result = await api.station(_ident(params.get("id")))
+        now = time.time()
+        for event in result["schedule"]:
+            event["now"] = _event_now(event, now)
+        return result
+
+    async def cmd_playStation(self, params: dict) -> dict:
+        station = params.get("station") if isinstance(params.get("station"), dict) else {}
+        station_id = _ident(station.get("id") or params.get("id"))
+        if not station_id.startswith("ra."):
+            raise ApiError("Not a station", code="bad-request")
+        api = await self._catalogue_api()
+        if not api.media_user_token:
+            raise ApiError("Sign in to Apple Music to listen to radio", code="unauthorized")
+        if station.get("type") != "station" or not station.get("playParams"):
+            station = (await api.station(station_id))["info"]
+        return await self._start_station(api, station)
+
+    async def cmd_createStation(self, params: dict) -> dict:
+        api = await self._catalogue_api()
+        if not api.media_user_token:
+            raise ApiError("Sign in to Apple Music to start a station", code="unauthorized")
+        item_id = _ident(params.get("catalogId") or params.get("id"))
+        station = await api.seeded_station(item_id, str(params.get("type") or "song"))
+        return await self._start_station(api, station)
+
+    async def cmd_enqueue(self, params: dict) -> dict:
+        """Play Next / Play Later."""
+        tracks = [t for t in (params.get("tracks") or []) if isinstance(t, dict) and t.get("id")]
+        if not tracks:
+            raise ApiError("Nothing to add", code="bad-request")
+        mode = "next" if params.get("mode") == "next" else "later"
+        async with self._command_lock:
+            if not self.queue:
+                await self._set_queue(tracks, 0, {"title": "Up Next"})
+                return {"count": len(self.queue)}
+            at = self.index + 1 if mode == "next" else len(self.queue)
+            self.queue[at:at] = tracks
+            self._station_seen.update(str(t.get("id")) for t in tracks)
+            await self._emit_state("queue")
+            if mode == "next" and not self._building():
+                self._generation += 1
+                self._schedule_prefetch()
+            return {"count": len(self.queue)}
+
+    async def cmd_lyrics(self, params: dict) -> dict:
+        api = await self._catalogue_api()
+        if not api.media_user_token:
+            raise ApiError("Sign in to Apple Music to see lyrics", code="unauthorized")
+        return await api.lyrics(_ident(params.get("id")), _ident(params.get("catalogId"), ""))
+
+    async def cmd_rating(self, params: dict) -> dict:
+        api = await self._require_api()
+        return {"value": await api.rating(str(params.get("type") or "song"), _ident(params.get("id")))}
+
+    async def cmd_rate(self, params: dict) -> dict:
+        api = await self._require_api()
+        try:
+            value = int(params.get("value") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        value = await api.rate(str(params.get("type") or "song"), _ident(params.get("id")), value)
+        return {"value": value}
+
+    async def cmd_addToLibrary(self, params: dict) -> dict:
+        api = await self._require_api()
+        await api.add_to_library(str(params.get("type") or "song"), _ident(params.get("id")))
+        await self.broadcast("notice", {"level": "success", "message": "Added to your library"})
+        return {"ok": True}
+
     async def cmd_play(self, params: dict) -> dict:
         tracks = params.get("tracks") or []
         index = int(params.get("index") or 0)
@@ -1127,6 +1501,11 @@ class Daemon:
         building = self._building()
         at_start = self.repeat != "all" and self.index <= 0
         current = self.now_playing()
+        if current is not None and current.get("type") == "station" and current.get("live"):
+            # Nothing to rewind in a live stream.
+            if self.index > 0:
+                await self._advance(-1)
+            return {"index": self.index}
         loaded = (current is not None and not self.player.state["idle"]
                   and str(self.player.state.get("songId")) == str(current.get("id")))
         if at_start or (not building and self.player.position() > 3):
@@ -1143,7 +1522,9 @@ class Daemon:
     async def cmd_seek(self, params: dict) -> dict:
         # While the next track is being prepared mpv still has the old one;
         # a seek there would move a song the UI no longer shows.
-        if not self.player.state.get("loading"):
+        current = self.now_playing() or {}
+        live = current.get("type") == "station" and current.get("live")
+        if not self.player.state.get("loading") and not live:
             await self.player.seek(float(params.get("pos") or 0))
         return self.player.snapshot()
 
@@ -1463,6 +1844,7 @@ class Daemon:
         # End mpv here rather than leaning on PDEATHSIG alone: that is
         # best-effort, and a clean exit should not leave cleanup to chance.
         await self.player.terminate()
+        await self.radio.close()
         if self._lock is None:
             # This launcher lost the race: the socket and pid file belong to
             # the daemon that holds the lock.

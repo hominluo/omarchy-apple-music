@@ -571,21 +571,27 @@ class Player:
             return self._resume[1]
         return 0.0
 
-    async def load(self, path: str, song_id: str, start: float = 0.0):
-        if not os.path.isfile(path):
+    async def load(self, path: str, song_id: str, start: float = 0.0,
+                   stream_title: str | None = None):
+        """Hand mpv a track. `path` is a cached file, or, with `stream_title`
+        set, a radio URL (the daemon's loopback proxy or a broadcaster's
+        stream), which mpv buffers and names by that title."""
+        if stream_title is None and not os.path.isfile(path):
             raise RuntimeError("The audio file is missing; play the track again")
         token = self._loading_token
         await self.ensure()
         # Once loadfile is on the wire, mpv plays this file whether or not the
         # caller is still waiting, so the bookkeeping must finish even if the
         # caller is cancelled; otherwise songId would name the wrong file.
-        handover = asyncio.ensure_future(self._hand_over(path, str(song_id), start, token))
+        handover = asyncio.ensure_future(
+            self._hand_over(path, str(song_id), start, token, stream_title))
         # If the caller was cancelled nobody awaits the result; reading the
         # exception here keeps asyncio from logging it as never retrieved.
         handover.add_done_callback(lambda task: task.cancelled() or task.exception())
         await asyncio.shield(handover)
 
-    async def _hand_over(self, path: str, song_id: str, start: float, token: int):
+    async def _hand_over(self, path: str, song_id: str, start: float, token: int,
+                         stream_title: str | None = None):
         epoch = self._epoch
         start = max(0.0, float(start or 0))
         # Unpause first and write the state before loadfile: what mpv says
@@ -600,19 +606,22 @@ class Player:
             "songId": song_id, "pos": 0.0, "duration": 0.0,
             "paused": False, "idle": False,
         })
-        response = await self._command(self._loadfile(path, start, legacy=False))
-        if (not _ok(response) and start > 1 and self._epoch == epoch
-                and self._connected()):
+        response = await self._command(self._loadfile(path, start, legacy=False,
+                                                      stream_title=stream_title))
+        if (not _ok(response) and (start > 1 or stream_title is not None)
+                and self._epoch == epoch and self._connected()):
             # An mpv older than 0.38 has no index argument and reads the -1
             # as the options; it takes them one place earlier.
-            response = await self._command(self._loadfile(path, start, legacy=True))
+            response = await self._command(self._loadfile(path, start, legacy=True,
+                                                          stream_title=stream_title))
         if not _ok(response):
             self._had_media = False
             self.state.update({"songId": previous, "paused": True, "idle": True})
             if self._epoch != epoch or not self._connected():
                 raise PlayerReset("mpv went away while the track was being handed over")
             raise RuntimeError("mpv did not accept the track")
-        self._loaded = (path, song_id)
+        # A stream cannot be replayed from a path (repeat-one rebuilds it).
+        self._loaded = (path, song_id) if stream_title is None else None
         self._resume = None
         if start > 1 and self._had_media:
             self._starting_at = start
@@ -621,14 +630,29 @@ class Player:
         await self._emit()
 
     @staticmethod
-    def _loadfile(path: str, start: float, legacy: bool) -> list:
+    def _loadfile(path: str, start: float, legacy: bool,
+                  stream_title: str | None = None) -> list:
         """The loadfile for `path`, starting `start` seconds in. The start
         goes in the load itself: mpv refuses a seek until the file has
         opened, which is after loadfile has already answered, so the seek
-        that used to follow it failed and the track played from 0:00."""
+        that used to follow it failed and the track played from 0:00.
+
+        A stream gets the buffering the cached files do without (mpv runs
+        with --cache=no) and the station's name as its title, which is what
+        MPRIS shows. Option values use mpv's %length% quoting, so a comma
+        or an equals sign in a station name cannot break the list."""
         command = ["loadfile", path, "replace"]
+        options = []
         if start > 1:
-            option = f"start={start:.3f}"
+            options.append(f"start={start:.3f}")
+        if stream_title is not None:
+            options += ["cache=yes", "demuxer-max-bytes=8MiB", "demuxer-max-back-bytes=2MiB",
+                        "demuxer-readahead-secs=30", "network-timeout=20"]
+            title = stream_title.replace("\n", " ").strip()[:200]
+            if title:
+                options.append(f"force-media-title=%{len(title.encode('utf-8'))}%{title}")
+        if options:
+            option = ",".join(options)
             command += [option] if legacy else [-1, option]
         return command
 

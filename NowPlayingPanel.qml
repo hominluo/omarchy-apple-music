@@ -47,6 +47,8 @@ Panel {
   readonly property real position: service ? service.position : 0
   readonly property real duration: service ? service.duration : 0
   readonly property bool canSeek: service ? service.canSeek === true : false
+  // A live station: no clock and no seek bar, just that it is on air.
+  readonly property bool isLive: service ? service.isLive === true : false
   readonly property string prepareMessage: service ? String(service.prepareMessage || "") : ""
   readonly property int volume: service ? Number(service.volume) || 0 : 0
   readonly property bool shuffleOn: service && service.queue ? service.queue.shuffle === true : false
@@ -196,7 +198,7 @@ Panel {
   }
 
   function seekBy(seconds) {
-    if (!service || !root.canSeek) return
+    if (!service || !root.canSeek || root.isLive) return
     var target = Math.max(0, Math.min(root.duration || 0, root.position + seconds))
     service.seek(target)
   }
@@ -214,7 +216,7 @@ Panel {
 
   function browse(view) {
     root.close()
-    if (service) service.browse(view || "")
+    if (service) service.openWindow(view || "")
   }
 
   function showNotice(text, level) {
@@ -454,6 +456,7 @@ Panel {
               spacing: Style.spacing.sm
 
               Text {
+                visible: !root.isLive
                 textFormat: Text.PlainText
                 text: root.formatTime(root.position)
                 color: root.faint
@@ -462,9 +465,29 @@ Panel {
                 renderType: Text.NativeRendering
               }
 
+              // A live stream has no position to show or move: the badge
+              // and the current show stand where the bar would be.
+              LiveBadge {
+                visible: root.isLive && root.prepareMessage === ""
+                accent: root.accent
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                Layout.fillWidth: true
+                visible: root.isLive && root.prepareMessage === ""
+                textFormat: Text.PlainText
+                text: root.artist
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                renderType: Text.NativeRendering
+              }
+
               SeekBar {
                 Layout.fillWidth: true
-                visible: root.prepareMessage === ""
+                visible: root.prepareMessage === "" && !root.isLive
                 foreground: root.foreground
                 accent: root.accent
                 position: root.position
@@ -489,6 +512,7 @@ Panel {
               }
 
               Text {
+                visible: !root.isLive
                 textFormat: Text.PlainText
                 text: root.formatTime(root.duration)
                 color: root.faint

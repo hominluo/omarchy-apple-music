@@ -70,7 +70,7 @@ Item {
   // outlives plugin updates, so the handshake checks this and the engine
   // version against manifest.json and replaces an engine from another
   // release instead of driving it with commands it does not have.
-  readonly property int protocol: 2
+  readonly property int protocol: 3
 
   signal notice(var payload)
 
@@ -80,6 +80,12 @@ Item {
   readonly property string artist: nowPlaying ? String(nowPlaying.artist || "") : ""
   readonly property string album: nowPlaying ? String(nowPlaying.album || "") : ""
   readonly property string artwork: nowPlaying ? String(nowPlaying.artwork || "") : ""
+  // A radio station is playing rather than a song: nowPlaying then names
+  // the station, and `artist` is its current show or provider.
+  readonly property bool isStation: hasSong && String(nowPlaying.type || "") === "station"
+  // A live stream (Apple Music 1, a broadcaster): no length and no seeking,
+  // only "now". Episodes and track stations are not live.
+  readonly property bool isLive: hasSong && nowPlaying.live === true
 
   // nowPlaying moves the moment a track is picked, but mpv keeps the old file
   // until the new one has been fetched and decrypted. player.songId is the
@@ -113,6 +119,9 @@ Item {
       return entry && entry.message ? "Unavailable: " + String(entry.message) : "This track is unavailable"
     }
     if (!preparing) return ""
+    // A station has no file to fetch and decrypt in the listener's terms:
+    // it is being tuned in, whatever step the daemon is on.
+    if (isStation) return "Tuning in…"
     switch (nowBuildStage) {
       case "resolving": return "Preparing… finding the stream"
       case "downloading": return "Preparing… downloading"
@@ -133,9 +142,10 @@ Item {
     return player ? Number(player.duration) || 0 : 0
   }
   // An idle player (mpv crashed or was released, or the queue ran out) has
-  // no file to seek in, even though songId and duration are still set.
+  // no file to seek in, even though songId and duration are still set. A
+  // live stream has nothing behind "now" to seek to.
   readonly property bool canSeek: connected && trackLoaded && !preparing && player.idle !== true
-                                  && duration > 0
+                                  && duration > 0 && !isLive
   readonly property int volume: player ? Math.max(0, Math.min(100, Math.round(Number(player.volume) || 0))) : 0
 
   readonly property var queueItems: queue && Array.isArray(queue.items) ? queue.items : []
@@ -731,7 +741,22 @@ Item {
 
   // ---- commands ----------------------------------------------------------
   function search(term, callback) { root.request("search", { term: term }, callback) }
-  function home(callback) { root.request("home", {}, callback) }
+  // The catalogue's pages, all answered as {title, sections}: "home"
+  // (personal, needs sign-in), "new" (editorial) and "radio".
+  function browse(page, callback) { root.request("browse", { page: String(page || "home") }, callback) }
+  function home(callback) { root.browse("home", callback) }
+  // A genre page, opened from a link on New or Radio.
+  function grouping(id, callback) { root.request("grouping", { id: String(id || "") }, callback) }
+  // A radio show or an editor: {info, sections}.
+  function curator(id, kind, callback) {
+    root.request("curator", { id: String(id || ""), kind: String(kind || "") }, callback)
+  }
+  function charts(callback) { root.request("charts", {}, callback) }
+  // A "See All" page, a page at a time like the library: {title, items, next}.
+  function room(id, offset, callback) {
+    if (typeof offset === "function") { callback = offset; offset = 0 }
+    root.request("room", { id: String(id || ""), offset: Math.max(0, Number(offset) || 0) }, callback)
+  }
   // `offset` pages through the library: the answer carries `next`, the
   // offset of the following page, or null after the last.
   function library(kind, offset, callback) {
@@ -748,6 +773,20 @@ Item {
     root.request("play", { tracks: tracks || [], index: index || 0, context: context || {} })
   }
   function playSong(song) { root.play([song], 0, { title: song.title, artwork: song.artwork }) }
+  // A station is not a track list: the daemon tunes in (a live stream) or
+  // fills the queue from it (a track station) and keeps it topped up.
+  function playStation(station, callback) { root.request("playStation", { station: station }, callback) }
+  // A station seeded from a song or an artist, which starts playing.
+  function createStation(id, type, callback) {
+    root.request("createStation", { id: String(id || ""), type: type === "artist" ? "artist" : "song" }, callback)
+  }
+  // Play Next / Play Later: into the queue after the current track, or at
+  // its end. Answers {count}.
+  function enqueue(tracks, mode, callback) {
+    root.request("enqueue", { tracks: tracks || [], mode: mode === "next" ? "next" : "later" }, callback)
+  }
+  // A live station's schedule: {info, schedule}.
+  function stationInfo(id, callback) { root.request("station", { id: String(id || "") }, callback) }
   function toggle() { root.request("toggle", {}) }
   function resume() { root.request("resume", {}) }
   function pause() { root.request("pause", {}) }
@@ -779,10 +818,22 @@ Item {
     })
   }
   function account(callback) { root.request("account", {}, callback) }
+  // {lines: [{begin, end, text}], synced, writers}; error code "not-found"
+  // is a song without lyrics.
+  function lyrics(id, callback) { root.request("lyrics", { id: String(id || "") }, callback) }
+  // Favourites: value 1 is a favourite, -1 "suggest less", 0 neither.
+  function rating(type, id, callback) { root.request("rating", { type: type, id: String(id || "") }, callback) }
+  function rate(type, id, value, callback) {
+    var v = Number(value) > 0 ? 1 : (Number(value) < 0 ? -1 : 0)
+    root.request("rate", { type: type, id: String(id || ""), value: v }, callback)
+  }
+  function addToLibrary(type, id, callback) { root.request("addToLibrary", { type: type, id: String(id || "") }, callback) }
   function cacheStats(callback) { root.request("cache", {}, callback) }
   function clearCache(callback) { root.request("clearCache", {}, callback) }
 
-  function browse(view, extra) {
+  // Summons the window, optionally on a view. Not `browse`: that is the
+  // daemon's page command above.
+  function openWindow(view, extra) {
     if (!root.shell || typeof root.shell.summon !== "function") return false
     var payload = extra ? extra : {}
     if (view) payload.view = view
@@ -799,6 +850,7 @@ Item {
       authExpired: root.authExpired,
       playing: root.playing,
       preparing: root.preparing,
+      live: root.isLive,
       title: root.title,
       artist: root.artist,
       position: root.position,
@@ -820,11 +872,11 @@ Item {
     function seek(position: string): void { root.seek(Number(position) || 0) }
     function volume(value: string): void { root.setVolume(Number(value) || 0) }
     function mute(): void { root.mute() }
-    function browse(): void { root.browse("") }
+    function browse(): void { root.openWindow("") }
     function openView(view: string, argsJson: string): void {
       var extra = {}
       try { extra = JSON.parse(argsJson || "{}") } catch (error) { extra = {} }
-      root.browse(view, extra)
+      root.openWindow(view, extra)
     }
     function status(): string { return JSON.stringify(root.status()) }
   }

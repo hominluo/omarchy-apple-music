@@ -1039,7 +1039,7 @@ class Protocol(unittest.TestCase):
         from engine import __version__
 
         manifest = json.loads((ROOT / "manifest.json").read_text("utf-8"))
-        self.assertEqual(daemon_module.PROTOCOL, 2)
+        self.assertEqual(daemon_module.PROTOCOL, 3)
         self.assertEqual(__version__, manifest["version"])
         self.assertEqual(daemon_module.ENGINE_VERSION, manifest["version"])
 

@@ -246,6 +246,9 @@ DEFAULT_SETTINGS = {
     "cacheLimitMb": 1024,
     "volume": 100,
     "muteRestore": 70,         # the level unmute returns to; written by mute
+    # When the queue runs out, keep playing with Apple's "similar music"
+    # station seeded from what just played, as the web player's Autoplay does.
+    "autoplay": True,
 }
 
 
@@ -278,11 +281,17 @@ def find_chrome() -> str | None:
     return None
 
 
-# Artwork URLs arrive as templates: .../{w}x{h}cc.jpg
-_ARTWORK_TEMPLATE = re.compile(r"\{w\}x\{h\}([a-z]{2})\.jpg")
+# Artwork URLs arrive as templates: .../{w}x{h}bb.jpg for catalogue covers,
+# .../{w}x{h}SC.DN02.jpg?l=en-US for editorial art, and the fully templated
+# .../{w}x{h}{c}.{f} on some records. Every shape gets a square of `size`.
+_ARTWORK_CROP = "bb"
+_ARTWORK_FORMAT = "jpg"
 
 
 def artwork_url(template: str | None, size: int = 320) -> str:
     if not template:
         return ""
-    return _ARTWORK_TEMPLATE.sub(lambda m: f"{size}x{size}{m.group(1)}.jpg", template)
+    size = int(size)
+    return (str(template)
+            .replace("{w}", str(size)).replace("{h}", str(size))
+            .replace("{c}", _ARTWORK_CROP).replace("{f}", _ARTWORK_FORMAT))

@@ -4,7 +4,8 @@ import qs.Ui
 import "../components"
 
 // Catalogue search. The field is local so the view owns its own typing
-// state; results are grouped the way the web player groups them.
+// state; results are grouped the way the web player groups them, radio
+// stations and shows included.
 Item {
   id: root
 
@@ -15,14 +16,30 @@ Item {
 
   signal open(string view, var args)
   signal playTracks(var tracks, int index, var context)
+  signal activateItem(var entry)
+  signal songMenu(var song, var source, real x, real y)
+
+  readonly property var emptyResults: ({ songs: [], albums: [], artists: [], playlists: [], stations: [], curators: [] })
+  // The card groups under the songs, in the web player's order.
+  readonly property var groups: [
+    { key: "albums", title: "Albums" },
+    { key: "playlists", title: "Playlists" },
+    { key: "artists", title: "Artists" },
+    { key: "stations", title: "Stations" },
+    { key: "curators", title: "Shows" }
+  ]
 
   property string term: ""
-  property var results: ({ songs: [], albums: [], artists: [], playlists: [] })
+  property var results: root.emptyResults
   property bool loading: false
   property string error: ""
   readonly property bool editing: field.activeFocus
-  readonly property bool hasResults: (results.songs || []).length + (results.albums || []).length
-                                        + (results.artists || []).length + (results.playlists || []).length > 0
+  readonly property bool hasResults: {
+    if ((results.songs || []).length > 0) return true
+    for (var i = 0; i < groups.length; i++)
+      if ((results[groups[i].key] || []).length > 0) return true
+    return false
+  }
 
   function activated() {
     field.forceActiveFocus()
@@ -48,7 +65,7 @@ Item {
     if (text === "") {
       root.loading = false
       root.error = ""
-      root.results = ({ songs: [], albums: [], artists: [], playlists: [] })
+      root.results = root.emptyResults
       return
     }
     root.loading = true
@@ -57,7 +74,7 @@ Item {
       if (token !== root.searchToken) return
       root.loading = false
       if (!ok) { root.error = result && result.message ? String(result.message) : "Search failed"; return }
-      root.results = result || ({ songs: [], albums: [], artists: [], playlists: [] })
+      root.results = result || root.emptyResults
     })
   }
 
@@ -166,17 +183,15 @@ Item {
               number: index + 1
               foreground: root.foreground
               accent: root.accent
+              menuEnabled: true
               onActivated: root.playTracks(root.results.songs, index, { title: "Search: " + root.term })
+              onMenuRequested: function(source, x, y) { root.songMenu(root.results.songs[index], source, x, y) }
             }
           }
         }
 
         Repeater {
-          model: [
-            { key: "albums", title: "Albums" },
-            { key: "playlists", title: "Playlists" },
-            { key: "artists", title: "Artists" }
-          ]
+          model: root.groups
 
           Column {
             id: group
@@ -207,9 +222,8 @@ Item {
                   item: modelData
                   foreground: root.foreground
                   accent: root.accent
-                  onActivated: root.open(modelData.type === "artist" ? "artist"
-                                         : (modelData.type === "playlist" ? "playlist" : "album"),
-                                         { id: modelData.id, library: modelData.library === true, title: modelData.title })
+                  // The entry itself, not the model's converted copy.
+                  onActivated: root.activateItem(group.entries[index])
                 }
               }
             }

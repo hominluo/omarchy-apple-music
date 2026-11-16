@@ -4,7 +4,7 @@ import qs.Commons
 import qs.Ui
 import "../components"
 
-// The saved library: songs, albums, playlists, artists.
+// The saved library: recently added, songs, albums, playlists, artists.
 //
 // Apple hands the library out a page at a time (100 items at most), so the
 // list grows as it is scrolled: reaching the end asks for the next page, and
@@ -20,6 +20,8 @@ Item {
 
   signal open(string view, var args)
   signal playTracks(var tracks, int index, var context)
+  signal activateItem(var entry)
+  signal songMenu(var song, var source, real x, real y)
 
   // The loaded items, for Play (which hands the daemon the plain objects)
   // and the counts. The views read `rows` instead: a ListModel that grows by
@@ -48,7 +50,8 @@ Item {
 
   readonly property string title: kind === "songs" ? "Songs"
     : kind === "albums" ? "Albums"
-    : kind === "playlists" ? "Playlists" : "Artists"
+    : kind === "playlists" ? "Playlists"
+    : kind === "recently-added" ? "Recently Added" : "Artists"
 
   function nextFrom(result, received) {
     var next = result ? result.next : null
@@ -230,9 +233,13 @@ Item {
       current: root.service && root.service.nowPlaying
                ? String(root.service.nowPlaying.id) === String(entry.id) : false
       playing: current && root.service ? root.service.playing : false
+      menuEnabled: true
       // The queue is the songs loaded so far; the rest join it as they load
       // only if Play is pressed again, which the "Load more" row makes plain.
       onActivated: root.playTracks(root.items, index, { title: "Library" })
+      // The plain object from `items`: a ListModel row is a copy the
+      // daemon's JSON would not take.
+      onMenuRequested: function(source, x, y) { root.songMenu(root.items[index], source, x, y) }
     }
 
     onAtYEndChanged: if (atYEnd && root.hasMore) root.loadMore()
@@ -252,16 +259,17 @@ Item {
     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
     footer: Component { MoreFooter { width: cardGrid.width } }
 
+    // Recently Added mixes albums, playlists and the odd station, so the
+    // window routes each by its type.
     delegate: Card {
+      required property int index
       required property var entry
 
       tileSize: cardGrid.tile
       item: entry
       foreground: root.foreground
       accent: root.accent
-      onActivated: root.open(entry.type === "artist" ? "artist"
-                             : (entry.type === "playlist" ? "playlist" : "album"),
-                             { id: entry.id, library: entry.library === true, title: entry.title })
+      onActivated: root.activateItem(root.items[index])
     }
 
     onAtYEndChanged: if (atYEnd && root.hasMore) root.loadMore()

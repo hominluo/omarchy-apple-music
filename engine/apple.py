@@ -268,7 +268,82 @@ def brief(item: dict, kind: str | None = None) -> dict:
         })
     elif item_type in ("artists", "artist", "library-artists"):
         base.update({"type": "artist", "artist": attributes.get("name") or ""})
+    elif item_type in ("stations", "station"):
+        base.update(_station_fields(attributes))
+    elif item_type in ("apple-curators", "curators", "curator"):
+        base.update({
+            "type": "curator",
+            # The path the curator page is read from: Apple's own shows and
+            # editors are apple-curators, third-party ones curators.
+            "curatorType": item_type if item_type != "curator" else "apple-curators",
+            "kind": attributes.get("kind") or "",
+            "artist": attributes.get("showHostName") or "",
+            "description": _notes(attributes),
+        })
+    elif item_type in ("music-videos", "uploaded-videos", "music-movies"):
+        # Listed on Apple's pages, but this is an audio player.
+        base.update({"type": "video", "artist": attributes.get("artistName") or "",
+                     "playable": False})
+    if base.get("library") and not base.get("catalogId"):
+        # A library album or playlist names its catalogue twin too; Favorite
+        # and Add to Library on the web player act on that one.
+        twin = str((attributes.get("playParams") or {}).get("catalogId")
+                   or (attributes.get("playParams") or {}).get("globalId") or "")
+        if twin and twin != item_id:
+            base["catalogId"] = twin
+    base.setdefault("playable", True)
+    if not base.get("artwork"):
+        base["artwork"] = config.artwork_url(
+            ((attributes.get("editorialArtwork") or {}).get("subscriptionHero")
+             or (attributes.get("editorialArtwork") or {}).get("superHeroWide")
+             or {}).get("url"), 360)
     return base
+
+
+def _notes(attributes: dict) -> str:
+    notes = attributes.get("plainEditorialNotes") or attributes.get("editorialNotes") or {}
+    if isinstance(notes, dict):
+        return str(notes.get("short") or notes.get("tagline") or notes.get("standard") or "")
+    return str(notes or "")
+
+
+def _station_fields(attributes: dict) -> dict:
+    """A station is one of three things to the player: a live stream (Apple
+    Music 1, a broadcaster), an on-demand stream (an episode, an interview),
+    or a track station that hands out songs (genre, artist, song, personal).
+    The first two are `stream`; only the last has a queue of its own."""
+    play = attributes.get("playParams") or {}
+    live = bool(attributes.get("isLive"))
+    stream = play.get("format") == "stream"
+    provider = str(attributes.get("stationProviderName") or "")
+    duration = int(attributes.get("durationInMillis") or 0)
+    if live:
+        subtitle = "LIVE" + (f" · {provider}" if provider else "")
+    elif stream:
+        kind = str(attributes.get("streamingRadioSubType") or "Episode")
+        subtitle = kind + (f" · {_duration_label(duration)}" if duration else "")
+    else:
+        subtitle = "Station"
+    return {
+        "type": "station",
+        "live": live,
+        "stream": stream,
+        "episode": stream and not live,
+        "durationMs": 0 if live else duration,
+        "subtitle": subtitle,
+        "artist": provider or subtitle,
+        "description": _notes(attributes),
+        "playParams": {key: value for key, value in play.items()
+                       if isinstance(value, (str, int, bool))},
+    }
+
+
+def _duration_label(ms: int) -> str:
+    minutes = round(ms / 60000)
+    if minutes >= 60:
+        hours, rest = divmod(minutes, 60)
+        return f"{hours} hr" + (f" {rest} min" if rest else "")
+    return f"{minutes} min"
 
 
 def _briefs(items: list[dict]) -> list[dict]:
@@ -439,20 +514,26 @@ class AppleApi:
     # -- catalog ----------------------------------------------------------
     async def search(self, term: str, kinds: str = "songs,albums,artists,playlists",
                      limit: int = 20) -> dict:
+        empty = {"songs": [], "albums": [], "artists": [], "playlists": [],
+                 "stations": [], "curators": []}
         if not term.strip():
-            return {"songs": [], "albums": [], "artists": [], "playlists": []}
+            return empty
+        if kinds == "songs,albums,artists,playlists":
+            # What the web player's search lists besides the music itself:
+            # radio stations and episodes, and Apple's shows and curators.
+            kinds += ",stations,apple-curators"
         data = await self._get(
             f"/v1/catalog/{self.storefront}/search",
             {"term": term, "types": kinds, "limit": limit, "l": self.language,
              "include[songs]": _RELATED},
         )
         results = data.get("results") or {}
-        return {
-            "songs": _briefs((results.get("songs") or {}).get("data") or []),
-            "albums": _briefs((results.get("albums") or {}).get("data") or []),
-            "artists": _briefs((results.get("artists") or {}).get("data") or []),
-            "playlists": _briefs((results.get("playlists") or {}).get("data") or []),
-        }
+        found = dict(empty)
+        for key, source in (("songs", "songs"), ("albums", "albums"), ("artists", "artists"),
+                            ("playlists", "playlists"), ("stations", "stations"),
+                            ("curators", "apple-curators")):
+            found[key] = _briefs((results.get(source) or {}).get("data") or [])
+        return found
 
     async def _collection(self, uri: str, params: dict) -> dict:
         data = await self._get(uri, params)
@@ -509,30 +590,43 @@ class AppleApi:
             {"include": "tracks", "limit[tracks]": 100, "l": self.language})
 
     async def artist(self, artist_id: str, library: bool = False) -> dict:
+        from . import catalog
+
         if library:
             data = await self._get(
                 f"/v1/me/library/artists/{artist_id}", {"include": "albums"})
         else:
+            # The artist page's sections, the way the web player asks for
+            # them: one request, each section a `view` of the artist.
             data = await self._get(
                 f"/v1/catalog/{self.storefront}/artists/{artist_id}",
-                {"include": "albums", "l": self.language},
+                {"include": "albums", "l": self.language,
+                 "views": ",".join(name for name, _kind in catalog.ARTIST_VIEWS),
+                 "include[songs]": _RELATED,
+                 "extend": "artistBio,editorialArtwork,plainEditorialNotes"},
             )
         records = data.get("data") or []
         if not records:
             raise ApiError("Artist not found", code="not-found")
         record = records[0]
         info = brief(record)
+        bio = str((record.get("attributes") or {}).get("artistBio") or "")
+        if bio:
+            info["description"] = re.sub(r"<[^>]+>", "", bio).strip()
         related = ((record.get("relationships") or {}).get("albums") or {})
         albums = list(related.get("data") or [])
         pages, truncated = await self._follow(related.get("next"), ARTIST_PAGES)
         for page in pages:
             albums.extend(page)
-        return {"info": info, "albums": _briefs(albums), "truncated": truncated}
+        sections = [] if library else catalog.artist_sections(record)
+        return {"info": info, "albums": _briefs(albums), "truncated": truncated,
+                "sections": sections}
 
     async def library(self, kind: str = "songs", limit: int = 100, offset: int = 0) -> dict:
         """One page of the library: {items, next}, where `next` is the offset
         to ask for after this page, or None after the last one."""
-        kind = kind if kind in ("songs", "albums", "playlists", "artists") else "songs"
+        kind = kind if kind in ("songs", "albums", "playlists", "artists",
+                                "recently-added") else "songs"
         try:
             offset = max(0, int(offset or 0))
             limit = max(1, min(100, int(limit or 100)))  # Apple's own page cap
@@ -541,6 +635,9 @@ class AppleApi:
         params = {"limit": limit, "offset": offset, "l": self.language}
         if kind == "songs":
             params["include"] = _RELATED
+        elif kind == "recently-added":
+            # Apple pages this one 25 at a time and refuses a larger limit.
+            params["limit"] = min(limit, 25)
         data = await self._get(f"/v1/me/library/{kind}", params)
         records = data.get("data") or []
         items = _briefs(records)
@@ -605,6 +702,302 @@ class AppleApi:
         if not records:
             raise ApiError("Song not found", code="not-found")
         return brief(records[0])
+
+    # -- pages ------------------------------------------------------------
+    # The query the web player sends for its pages, minus what only video
+    # and social surfaces use. `platform` is required by the editorial and
+    # recommendation endpoints.
+    def _page_params(self, **extra) -> dict:
+        params = {
+            "platform": "web",
+            "l": self.language,
+            "omit[resource:artists]": "autos",
+            "include[stations]": "events,radio-show",
+            "include[songs]": _RELATED,
+            "extend": "editorialArtwork,plainEditorialNotes",
+        }
+        params.update(extra)
+        return params
+
+    async def browse_page(self, name: str) -> dict:
+        """New ("music") or Radio ("radio"): an editorial grouping by name."""
+        from . import catalog
+
+        subscribed = "subscriber" if self.media_user_token else "nonsubscriber"
+        data = await self._get(f"/v1/editorial/{self.storefront}/groupings",
+                               self._page_params(name=name, tabs=subscribed))
+        title, sections = catalog.grouping_sections(data)
+        return {"title": title, "sections": sections}
+
+    async def grouping(self, grouping_id: str) -> dict:
+        from . import catalog
+
+        data = await self._get(f"/v1/editorial/{self.storefront}/groupings/{grouping_id}",
+                               self._page_params())
+        title, sections = catalog.grouping_sections(data)
+        if not sections:
+            raise ApiError("Nothing to show on this page", code="not-found")
+        return {"title": title, "sections": sections}
+
+    async def listen_now(self) -> dict:
+        """Home: Top Picks, Recently Played, Made for You, Stations for You."""
+        from . import catalog
+
+        offset = -time.altzone if time.daylight and time.localtime().tm_isdst else -time.timezone
+        sign = "+" if offset >= 0 else "-"
+        hours, minutes = divmod(abs(offset) // 60, 60)
+        data = await self._get("/v1/me/recommendations", {
+            "platform": "web",
+            "name": "listen-now",
+            "timezone": f"{sign}{hours:02d}:{minutes:02d}",
+            "with": "library",
+            "types": "albums,apple-curators,artists,curators,editorial-items,"
+                     "library-albums,library-playlists,playlists,songs,stations",
+            "include[library-playlists]": "catalog",
+            "include[personal-recommendation]": "primary-content",
+            "include[stations]": "radio-show",
+            "omit[resource]": "autos",
+            "extend[playlists]": "artistNames",
+            "extend": "plainEditorialNotes",
+            "l": self.language,
+        })
+        return {"title": "Home", "sections": catalog.recommendation_sections(data)}
+
+    async def recent_stations(self, limit: int = 12) -> list[dict]:
+        data = await self._get("/v1/me/recent/radio-stations",
+                               {"limit": limit, "include[stations]": "radio-show",
+                                "omit[resource]": "autos", "l": self.language})
+        return _briefs(data.get("data") or [])
+
+    async def room(self, room_id: str, offset: int = 0) -> dict:
+        """One See All page: {title, items, next}."""
+        from . import catalog
+
+        offset = max(0, int(offset or 0))
+        if offset:
+            data = await self._get(f"/v1/editorial/{self.storefront}/rooms/{room_id}/contents",
+                                   self._page_params(offset=offset, limit=100))
+        else:
+            data = await self._get(f"/v1/editorial/{self.storefront}/rooms/{room_id}",
+                                   self._page_params())
+        title, items, next_href = catalog.room_page(data)
+        return {"title": title, "items": items,
+                "next": _next_offset(next_href, offset, len(items))}
+
+    async def curator(self, curator_id: str, kind: str = "apple-curators") -> dict:
+        """A radio show or an editor: its record, and its page's shelves."""
+        from . import catalog
+
+        kind = kind if kind in ("apple-curators", "curators") else "apple-curators"
+        data = await self._get(f"/v1/catalog/{self.storefront}/{kind}/{curator_id}",
+                               {"include": "grouping,playlists", "l": self.language,
+                                "platform": "web", "extend": "plainEditorialNotes"})
+        records = data.get("data") or []
+        if not records:
+            raise ApiError("Not found", code="not-found")
+        record = records[0]
+        info = brief(record)
+        sections: list[dict] = []
+        groupings = ((record.get("relationships") or {}).get("grouping") or {}).get("data") or []
+        if groupings:
+            try:
+                page = await self._get(
+                    f"/v1/editorial/{self.storefront}/groupings/{groupings[0]['id']}",
+                    self._page_params())
+                _title, sections = catalog.grouping_sections(page)
+            except ApiError as error:
+                if error.code == "unauthorized":
+                    raise
+                log.info("curator page %s: %s", curator_id, error.message)
+        if not sections:
+            playlists = ((record.get("relationships") or {}).get("playlists") or {}).get("data") or []
+            items = _briefs(playlists)
+            if items:
+                sections = [{"id": "playlists", "title": "Playlists", "kind": "cards",
+                             "items": items, "seeAll": None}]
+        return {"info": info, "sections": sections}
+
+    async def charts(self) -> dict:
+        data = await self._get(f"/v1/catalog/{self.storefront}/charts", {
+            "types": "songs,albums,playlists", "limit": 30, "l": self.language,
+            "include[songs]": _RELATED,
+        })
+        sections = []
+        for key in ("songs", "albums", "playlists"):
+            for chart in (data.get("results") or {}).get(key) or []:
+                items = _briefs(chart.get("data") or [])
+                if items:
+                    sections.append({
+                        "id": f"{key}:{chart.get('chart') or ''}",
+                        "title": str(chart.get("name") or key.title()),
+                        "kind": "songs" if key == "songs" else "cards",
+                        "items": items, "seeAll": None,
+                    })
+        return {"title": "Charts", "sections": sections}
+
+    # -- radio ------------------------------------------------------------
+    async def station(self, station_id: str) -> dict:
+        """A station's brief, and for a live one its schedule."""
+        data = await self._get(f"/v1/catalog/{self.storefront}/stations/{station_id}",
+                               {"include": "events,radio-show", "l": self.language,
+                                "extend": "plainEditorialNotes"})
+        records = data.get("data") or []
+        if not records:
+            raise ApiError("Station not found", code="not-found")
+        record = records[0]
+        schedule = []
+        for event in ((record.get("relationships") or {}).get("events") or {}).get("data") or []:
+            attributes = event.get("attributes") or {}
+            schedule.append({
+                "title": str(attributes.get("title") or attributes.get("name") or ""),
+                "start": str(attributes.get("startTime") or ""),
+                "end": str(attributes.get("endTime") or ""),
+                "artwork": config.artwork_url((attributes.get("heroArtwork")
+                                               or attributes.get("artwork") or {}).get("url"), 360),
+            })
+        return {"info": brief(record), "schedule": schedule}
+
+    async def station_tracks(self, station_id: str, limit: int = 10) -> list[dict]:
+        """The next batch of songs from a track station (genre, artist, song,
+        personal). Each call hands out new ones, as the web player's does."""
+        data = await self._post(
+            f"{AMP}/v1/me/stations/next-tracks/{station_id}?limit={max(1, min(25, int(limit)))}", {})
+        return [item for item in _briefs(data.get("data") or []) if item.get("type") == "song"]
+
+    async def seeded_station(self, item_id: str, kind: str) -> dict:
+        """The station Create Station starts: a song's or an artist's."""
+        kind = "artists" if kind in ("artist", "artists") else "songs"
+        data = await self._get(f"/v1/catalog/{self.storefront}/{kind}/{item_id}/station",
+                               {"l": self.language})
+        records = data.get("data") or []
+        if not records:
+            raise ApiError("Apple Music has no station for this", code="not-found")
+        return brief(records[0])
+
+    async def continuous(self, seeds: list[dict], limit: int = 10) -> tuple[dict, list[dict]]:
+        """Autoplay: a station seeded from what just played, with its first
+        tracks. Library songs seed by their catalogue twin."""
+        data = []
+        for seed in seeds:
+            song_id = str(seed.get("catalogId") or seed.get("id") or "")
+            if song_id.isdigit():
+                data.append({"id": song_id, "type": "songs"})
+        if not data:
+            raise ApiError("Nothing to continue from", code="not-found")
+        answer = await self._post(
+            f"{AMP}/v1/me/stations/continuous?limit%5Bresults%3Atracks%5D={int(limit)}&with=tracks",
+            {"data": data[-5:]})
+        results = answer.get("results") or {}
+        station = brief(results["station"]) if results.get("station") else {}
+        tracks = results.get("tracks") or []
+        if isinstance(tracks, dict):
+            tracks = tracks.get("data") or []
+        tracks = [item for item in _briefs(tracks) if item.get("type") == "song"]
+        return station, tracks
+
+    async def play_assets(self, play_params: dict) -> dict:
+        """Where a stream station's audio is: {url, keyServerUrl?}. The web
+        player asks the same endpoint with the station's playParams."""
+        params = {key: (str(value).lower() if isinstance(value, bool) else str(value))
+                  for key, value in (play_params or {}).items()}
+        params["keyFormat"] = "web"
+        data = await self._get("/v1/play/assets", params)
+        assets = (data.get("results") or {}).get("assets") or []
+        if not assets or not assets[0].get("url"):
+            raise ApiError("Apple Music has no stream for this station", code="unavailable")
+        return assets[0]
+
+    def radio_license(self, url: str, key_uri: str, challenge: str) -> dict:
+        """The Widevine licence for a radio stream. Unlike a song's, it goes
+        to the key server the asset names, with the user token in a header
+        and the event the web player sends for audio radio. Called from a
+        worker thread; tried once."""
+        host = (urlsplit(url).hostname or "") if url.startswith("https://") else ""
+        if not host.endswith(".apple.com"):
+            raise ApiError("Unexpected licence server", code="unavailable")
+        headers = self._headers()
+        headers.update({"X-Apple-Music-User-Token": self.media_user_token,
+                        "X-Apple-Renewal": "true", "Content-Type": "application/json"})
+        try:
+            response = self.session.post(url, json={
+                "challenge": challenge, "uri": key_uri,
+                "key-system": "com.widevine.alpha", "event": "beats1",
+            }, headers=headers, timeout=30)
+        except requests.RequestException as error:
+            raise ApiError(f"Network error: {_describe(error)}", code="network") from error
+        if response.status_code in (401, 403):
+            raise ApiError("Apple Music refused the radio licence (check the subscription)",
+                           status=response.status_code, code="unavailable")
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if response.status_code >= 400 or body.get("status") not in (0, None) or not body.get("license"):
+            raise ApiError(f"Radio licence failed ({body.get('status', response.status_code)})",
+                           code="unavailable")
+        return body
+
+    # -- personal ---------------------------------------------------------
+    async def lyrics(self, song_id: str, catalog_id: str = "") -> dict:
+        from . import catalog
+
+        song_id = catalog_id if catalog_id and not str(song_id).isdigit() else str(song_id)
+        if not song_id.isdigit():
+            raise ApiError("No lyrics for this track", code="not-found")
+        try:
+            data = await self._get(f"/v1/catalog/{self.storefront}/songs/{song_id}/lyrics",
+                                   {"l": self.language})
+        except ApiError as error:
+            if error.status == 404:
+                raise ApiError("No lyrics for this track", status=404, code="not-found") from error
+            raise
+        records = data.get("data") or []
+        ttml = str(((records[0].get("attributes") or {}).get("ttml")) if records else "")
+        try:
+            parsed = catalog.parse_lyrics(ttml)
+        except (ValueError, SyntaxError) as error:
+            raise ApiError("Could not read these lyrics", code="unavailable") from error
+        if not parsed["lines"]:
+            raise ApiError("No lyrics for this track", code="not-found")
+        return parsed
+
+    @staticmethod
+    def _rating_path(kind: str, item_id: str) -> str:
+        kind = {"song": "songs", "album": "albums", "playlist": "playlists"}.get(kind, kind)
+        if kind not in ("songs", "albums", "playlists"):
+            raise ApiError("Only songs, albums and playlists can be favourited", code="bad-request")
+        if in_library({"id": item_id}):
+            kind = "library-" + kind
+        return f"/v1/me/ratings/{kind}/{item_id}"
+
+    async def rating(self, kind: str, item_id: str) -> int:
+        try:
+            data = await self._get(self._rating_path(kind, item_id))
+        except ApiError as error:
+            if error.status == 404:
+                return 0
+            raise
+        for record in data.get("data") or []:
+            return int((record.get("attributes") or {}).get("value") or 0)
+        return 0
+
+    async def rate(self, kind: str, item_id: str, value: int) -> int:
+        path = self._rating_path(kind, item_id)
+        value = 1 if value > 0 else (-1 if value < 0 else 0)
+        if value == 0:
+            await asyncio.to_thread(self._request, "DELETE", path)
+        else:
+            await asyncio.to_thread(self._request, "PUT", path, None,
+                                    {"type": "rating", "attributes": {"value": value}})
+        return value
+
+    async def add_to_library(self, kind: str, item_id: str) -> None:
+        kind = {"song": "songs", "album": "albums", "playlist": "playlists"}.get(kind, kind)
+        if kind not in ("songs", "albums", "playlists") or not str(item_id):
+            raise ApiError("Only songs, albums and playlists can be added", code="bad-request")
+        if in_library({"id": item_id}):
+            return
+        await asyncio.to_thread(self._request, "POST", f"/v1/me/library?ids[{kind}]={item_id}")
 
     # -- playback ---------------------------------------------------------
     async def webplayback(self, song_id: str, catalog_id: str = "") -> dict:

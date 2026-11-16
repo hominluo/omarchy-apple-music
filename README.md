@@ -1,8 +1,9 @@
 # Apple Music for Omarchy
 
-A native Apple Music player for the [Omarchy](https://omarchy.org) shell — catalog
-and library browsing in a full window, pause/skip/seek right under the bar icon,
-and playback through mpv. No Electron, no browser at runtime.
+A native Apple Music player for the [Omarchy](https://omarchy.org) shell — Home,
+New, Radio, search and your library in a full window, pause/skip/seek right under
+the bar icon, and playback through mpv. Apple Music 1 and the other live
+stations play too. No Electron, no browser at runtime.
 
 The web player (Cider and friends) is a browser wrapped around MusicKit: it works,
 but it costs half a gigabyte of memory and a second Chrome to play a song. Apple
@@ -18,8 +19,8 @@ The bar cell is a now-playing dropdown, not just a launcher:
 
 - **Left click** — seek, transport, volume and Up Next without opening the
   window.
-- **Right click** — the full window: Home, Browse, Search, your library, the
-  queue, and sign-in.
+- **Right click** — the full window: Home, New, Radio, Search, your library,
+  the queue, lyrics, and sign-in.
 - **Middle click** — play/pause.
 - **Wheel** — volume, or seek, per the `wheelAction` setting.
 
@@ -29,11 +30,6 @@ cursor with the keyboard, in which case it acts on that row. `m` mutes, `n`/`p`
 skip, `,`/`.` seek ten seconds, `s` shuffles, `r` cycles repeat, `o` opens the
 window and `q` opens the queue in it. Tab moves to the next bar dropdown and
 Escape closes.
-
-In the window, Space plays/pauses, `←`/`→` skip, `/` goes to Search and `q`
-to the queue (all of them stay out of the way while you type in the search
-field). Escape goes back a view; on the first view it closes the window. In
-Search, the first Escape clears the field.
 
 `omarchy-shell io.github.hominluo.apple-music.panel toggle` opens the dropdown
 on the focused monitor, for a keybinding.
@@ -45,13 +41,41 @@ spacing units) and longer titles scroll; set it to `0` to leave only the glyph.
 Like the Podcast cell, the title is a playing indicator: pause and the cell goes
 back to just the music note.
 
+## The window
+
+The pages are the web player's:
+
+- **Home** — your recommendations: Top Picks, Recently Played, playlists and
+  stations made for you, new releases for you.
+- **New** — Apple's editorial page, its charts and playlists, and every genre
+  page (Browse by Genre at the bottom).
+- **Radio** — the stations you played last, Apple Music 1 and the other live
+  stations, local and international broadcasters, radio shows and their
+  episodes, interviews, and the genre stations.
+- **Search** — songs, albums, artists, playlists, stations and shows.
+- **Library** — Recently Added, Artists, Albums, Songs, Playlists.
+
+Every shelf with more behind it has a See All. Artist pages have the same
+sections as on the web (Top Songs, Albums, Singles & EPs, Similar Artists…).
+A song's menu (the ⋯ on its row, or a right click) has Play Next, Play Later,
+Create Station, Favorite, Add to Library and the links to its album and
+artist. **Lyrics** in the footer shows the playing song's lyrics, following
+along when Apple has them timed. When the queue runs out, Autoplay keeps going
+with similar music, as on the web; set `autoplay` to `false` to stop there.
+
+In the window, Space plays/pauses, `←`/`→` skip, `/` goes to Search and `q`
+to the queue (all of them stay out of the way while you type in the search
+field). Escape goes back a view; on the first view it closes the window. In
+Search, the first Escape clears the field.
+
 In the window, the cover in the footer opens the album that is playing and the
 artist line opens the artist, so a song heard somewhere can be followed back to
 its record without a search.
 
 A track that is not in the cache yet is downloaded and decrypted before it
 plays. Meanwhile its title shows with "Preparing…" and the step it is on, and
-seeking waits until it is loaded. If it cannot be built, it shows as
+seeking waits until it is loaded. A live station shows LIVE and the show on
+air instead of a seek bar. If it cannot be built, it shows as
 unavailable with the reason and the queue moves on.
 
 Your library loads a page at a time: scroll to the end, or press Load more.
@@ -69,6 +93,21 @@ says so.
   cached credential, local Widevine decryption, and mpv over its JSON IPC.
 - **Transport** published through MPRIS by `mpv-mpris`, so media keys,
   `omarchy.media` and the bar work without extra plumbing.
+
+## How radio is played
+
+A live station never ends and an episode runs for hours, so neither is built
+into a file first. The daemon asks Apple where the station's stream is (the
+same `play/assets` call the web player makes) and serves mpv a decrypted copy
+of it from a small HTTP server on `127.0.0.1`: mpv reads the station's HLS
+playlist from there, and each segment it asks for is fetched from Apple,
+decrypted with the content key from the radio key server, and handed over as
+plain MPEG-TS. mpv's own HLS reader follows the live edge and seeks within
+episodes. The server answers only on the loopback interface and only on paths
+that start with a random token the daemon gives its own mpv. Broadcasters
+(NPR, iHeartRadio, TuneIn stations) are not encrypted and go to mpv as Apple's
+URL directly. Genre, artist and song stations hand out songs, which play like
+any other track; the next batch is fetched before the queue runs out.
 
 ## How a track is played
 
@@ -229,6 +268,8 @@ $XDG_CACHE_HOME/omarchy/apple-music/   audio/, artwork/, engine.log
   and Edge profiles, not just the plugin's own profile. Restart the daemon
   after changing it.
 - `prefetch`: tracks built ahead of the one playing; 0 turns it off.
+- `autoplay`: default `true`. When the queue runs out, keep playing a station
+  seeded from the last songs, as the web player's Autoplay does.
 - `volume`: 0–100, the level the player comes back at after a restart. A
   saved 0 stays muted.
 - `muteRestore`: the level unmute goes back to. Mute (`m` in the dropdown, or
@@ -252,6 +293,7 @@ omarchy-shell io.github.hominluo.apple-music next
 omarchy-shell io.github.hominluo.apple-music mute
 omarchy-shell io.github.hominluo.apple-music volume 40
 omarchy-shell io.github.hominluo.apple-music openView album '{"id":"1441133277","library":false}'
+omarchy-shell io.github.hominluo.apple-music openView radio '{}'
 ```
 
 The daemon itself speaks NDJSON on `$XDG_RUNTIME_DIR/omarchy-apple-music/daemon.sock`
@@ -269,8 +311,9 @@ decryption one.
 
 - Apple's private web-playback endpoint and the licence exchange are
   undocumented and can change without notice.
-- One account, one storefront (your subscription's). No lyrics, video, radio or
-  lossless.
+- One account, one storefront (your subscription's). No music videos or
+  video interviews (they are left off the pages), no lossless or Spatial
+  Audio (the web player has neither), and no social features.
 - Library playlists have no artwork of their own; the first track's cover is
   shown instead.
 - The bar cell appears once per monitor but the window is a single overlay.

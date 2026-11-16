@@ -109,7 +109,8 @@ Item {
           if (modelData === "shuffle") return root.withHint(root.shuffleOn ? "Shuffle: on" : "Shuffle: off", "shuffle")
           if (modelData === "previous") return root.withHint("Previous", "previous")
           if (modelData === "playPause")
-            return root.preparing ? "Preparing…" : root.withHint(root.playing ? "Pause" : "Play", "playPause")
+            return root.preparing ? (root.service && root.service.isStation ? "Tuning in…" : "Preparing…")
+                                  : root.withHint(root.playing ? "Pause" : "Play", "playPause")
           if (modelData === "next") return root.withHint("Next", "next")
           return root.withHint(root.repeatLabel(), "repeat")
         }

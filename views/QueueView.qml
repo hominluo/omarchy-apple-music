@@ -14,6 +14,7 @@ Item {
 
   signal playTracks(var tracks, int index, var context)
   signal jump(int index)
+  signal songMenu(var song, var source, real x, real y)
 
   readonly property var items: service ? service.queueItems : []
   readonly property int currentIndex: service ? service.queueIndex : -1
@@ -88,6 +89,8 @@ Item {
                ? String(root.service.buildStages[modelData.id].stage || "") : ""
         foreground: root.foreground
         accent: root.accent
+        menuEnabled: true
+        onMenuRequested: function(source, x, y) { root.songMenu(root.items[index], source, x, y) }
         onActivated: {
           if (index === root.currentIndex && root.service) root.service.toggle()
           else root.jump(index)

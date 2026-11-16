@@ -48,8 +48,10 @@ Item {
       cache: true
       smooth: true
       fillMode: Image.PreserveAspectCrop
-      sourceSize.width: Math.round(root.size * 2)
-      sourceSize.height: Math.round(root.size * 2)
+      // A wide tile (a hero card) is wider than `size`: decode for the
+      // longer side, or the crop would be upscaled.
+      sourceSize.width: Math.round(Math.max(root.size, root.width) * 2)
+      sourceSize.height: Math.round(Math.max(root.size, root.height) * 2)
       visible: root.ready
       opacity: root.ready ? 1 : 0
       Behavior on opacity { NumberAnimation { duration: 160 } }
