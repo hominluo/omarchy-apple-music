@@ -15,7 +15,8 @@ import "components"
 //
 // Layout: sidebar of views on the left, the current view in the main pane,
 // and the player across the bottom. Navigation is a stack so Escape and
-// Backspace walk back before closing.
+// Backspace walk back before closing. Keys: Space play/pause, ←/→ previous
+// and next, q the queue, / search (the footer's tooltips name the same keys).
 Item {
   id: root
 
@@ -56,7 +57,12 @@ Item {
 
   // ---- service shortcuts -------------------------------------------------
   readonly property bool connected: service ? service.connected : false
+  readonly property string connection: service ? service.connection : "connecting"
   readonly property bool signedIn: service ? service.signedIn : false
+  readonly property bool authExpired: service ? service.authExpired === true : false
+  readonly property bool needsSignIn: !signedIn || authExpired
+  readonly property bool hasToken: service ? service.hasToken === true : false
+  readonly property string storefront: service ? String(service.storefront || "") : ""
   readonly property bool hasSong: service ? service.hasSong : false
   readonly property var player: service ? service.player : null
   readonly property var nowPlaying: service ? service.nowPlaying : null
@@ -106,6 +112,12 @@ Item {
     var payload = {}
     try { payload = JSON.parse(String(payloadJson || "{}")) || {} } catch (e) { payload = {} }
     var target = payload.view ? String(payload.view) : ""
+    // Opening the window is the user asking for the player: retry a daemon
+    // that is backing off now rather than in a minute.
+    if (root.service && typeof root.service.wake === "function") root.service.wake()
+    // Every opening starts a fresh back stack, so Escape on the first view
+    // closes the window instead of walking through an earlier session.
+    root.history = []
     root.opened = true
     root.editing = false
     if (target !== "") root.navigate(target, payload, false)
@@ -124,12 +136,31 @@ Item {
   function close() {
     root.opened = false
     root.editing = false
+    root.history = []
   }
 
-  function dismiss() { root.close() }
+  // Closing from inside (scrim, Escape on the first view) also tells the
+  // host, so its open state does not go on saying the window is up.
+  function dismiss() {
+    root.close()
+    if (root.shell && typeof root.shell.hide === "function") root.shell.hide(root.pluginId)
+  }
+
+  function sameView(target, args) {
+    if (target !== root.view) return false
+    var a = args || {}
+    var current = root.viewArgs || {}
+    if (target === "library") return String(a.kind || root.libraryKind) === root.libraryKind
+    return String(a.id || "") === String(current.id || "")
+  }
 
   function navigate(target, args, push) {
-    if (push !== false && root.opened) root.history.push({ view: root.view, args: root.viewArgs, kind: root.libraryKind })
+    // `history` is reassigned, never pushed to: an in-place push emits no
+    // change, and the back button's visibility binding would never update.
+    if (push !== false && root.opened && !root.sameView(target, args)) {
+      var stack = root.history.concat([{ view: root.view, args: root.viewArgs, kind: root.libraryKind }])
+      root.history = stack.slice(-30)
+    }
     // libraryKind first: changing `view` reloads the Loader, and onViewLoaded
     // copies the kind into the new item.
     if (target === "library" && args && args.kind) root.libraryKind = String(args.kind)
@@ -140,8 +171,10 @@ Item {
   }
 
   function back() {
-    if (root.history.length === 0) { root.close(); return }
-    var entry = root.history.pop()
+    if (root.history.length === 0) { root.dismiss(); return }
+    var stack = root.history.slice()
+    var entry = stack.pop()
+    root.history = stack
     root.libraryKind = entry.kind || "songs"
     root.viewArgs = entry.args || {}
     root.view = entry.view
@@ -278,9 +311,21 @@ Item {
         Keys.onEscapePressed: root.back()
         Keys.onBackPressed: root.back()
         Keys.onSpacePressed: if (!root.editing && root.service) root.service.toggle()
+        // The search field keeps its own arrows and letters while it edits.
         Keys.onPressed: function(event) {
-          if (event.key === Qt.Key_Slash && !root.editing) {
+          if (root.editing) return
+          if (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) return
+          if (event.key === Qt.Key_Slash) {
             root.navigate("search", {}, true)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Left) {
+            if (root.service) root.service.previous()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Right) {
+            if (root.service) root.service.next()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Q) {
+            root.navigate("queue", {}, true)
             event.accepted = true
           }
         }
@@ -338,10 +383,15 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 visible: !root.connected
                 textFormat: Text.PlainText
-                text: root.connection === "starting" ? "starting…" : "connecting…"
-                color: root.faint
+                text: root.connection === "unavailable"
+                      ? "player unavailable" + (root.service && root.service.currentError
+                                                ? ": " + String(root.service.currentError) : "")
+                      : (root.connection === "starting" ? "starting…" : "connecting…")
+                color: root.connection === "unavailable" ? root.urgent : root.faint
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+                width: Math.min(implicitWidth, Style.space(420))
               }
             }
 
@@ -362,8 +412,18 @@ Item {
                 width: Math.min(implicitWidth, Style.space(360))
               }
 
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.authExpired
+                textFormat: Text.PlainText
+                text: "Apple Music signed you out"
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
               Rectangle {
-                visible: !root.signedIn
+                visible: root.needsSignIn
                 width: signinLabel.implicitWidth + Style.spacing.lg * 2
                 height: Style.space(28)
                 radius: Style.cornerRadius > 0 ? Math.min(Style.cornerRadius, Style.spacing.sm) : height / 2
@@ -375,7 +435,7 @@ Item {
                   id: signinLabel
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
-                  text: "Sign in to Apple Music"
+                  text: root.authExpired ? "Sign in again" : "Sign in to Apple Music"
                   color: root.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -388,7 +448,10 @@ Item {
                   onTapped: {
                     if (!root.service) return
                     root.service.signIn(function(ok, result) {
-                      root.noticeText = ok ? "Finish signing in in the window that opened" : "Could not open a sign-in window"
+                      // The daemon's reason (no browser found, a window
+                      // already open) is the useful part of a failure.
+                      root.noticeText = ok ? "Finish signing in in the window that opened"
+                                           : (result && result.message ? String(result.message) : "Could not open a sign-in window")
                       root.noticeUrgent = !ok
                       noticeTimer.restart()
                     })
@@ -398,12 +461,62 @@ Item {
 
               Text {
                 anchors.verticalCenter: parent.verticalCenter
-                visible: root.signedIn && root.service && root.service.auth && root.service.auth.name !== ""
+                visible: !root.needsSignIn && root.service && root.service.auth && !!root.service.auth.name
                 textFormat: Text.PlainText
-                text: root.service && root.service.auth ? String(root.service.auth.name) : ""
+                text: root.service && root.service.auth ? String(root.service.auth.name || "") : ""
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
+              }
+
+              // Sign out asks once more on the same button: it also clears the
+              // sign-in profile's session, so a stray click costs a real login.
+              // It stays next to "Sign in again" when Apple has turned the
+              // token down: that token is still stored and re-checked at every
+              // start until it is signed out.
+              Rectangle {
+                id: signoutButton
+                visible: root.hasToken
+                property bool confirming: false
+                width: signoutLabel.implicitWidth + Style.spacing.md * 2
+                height: Style.space(28)
+                radius: Style.cornerRadius > 0 ? Math.min(Style.cornerRadius, Style.spacing.sm) : height / 2
+                color: signoutArea.hovered || confirming ? Util.alpha(root.foreground, 0.10) : "transparent"
+                border.color: confirming ? Util.alpha(root.urgent, 0.6) : Util.alpha(root.foreground, 0.18)
+                border.width: Math.max(1, Style.normalBorderWidth)
+
+                Text {
+                  id: signoutLabel
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: signoutButton.confirming ? "Sign out?" : "Sign out"
+                  color: signoutButton.confirming ? root.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  renderType: Text.NativeRendering
+                }
+
+                Timer { id: signoutConfirmTimer; interval: 3000; onTriggered: signoutButton.confirming = false }
+
+                HoverHandler { id: signoutArea; cursorShape: Qt.PointingHandCursor }
+                TapHandler {
+                  onTapped: {
+                    if (!root.service) return
+                    if (!signoutButton.confirming) {
+                      signoutButton.confirming = true
+                      signoutConfirmTimer.restart()
+                      return
+                    }
+                    signoutButton.confirming = false
+                    signoutConfirmTimer.stop()
+                    root.service.signOut(function(ok, result) {
+                      root.noticeText = ok ? "Signed out of Apple Music"
+                                           : (result && result.message ? String(result.message) : "Could not sign out")
+                      root.noticeUrgent = !ok
+                      noticeTimer.restart()
+                    })
+                  }
+                }
               }
             }
           }
@@ -464,22 +577,22 @@ Item {
 
                   HoverHandler { id: sidebarHover; cursorShape: Qt.PointingHandCursor }
                   TapHandler {
-                    onTapped: {
-                      if (modelData.view === "library") root.libraryKind = String(modelData.kind)
-                      root.navigate(String(modelData.view), modelData.kind ? { kind: modelData.kind } : {}, true)
-                    }
+                    // navigate() sets libraryKind itself, after it has pushed
+                    // the current kind and compared against it.
+                    onTapped: root.navigate(String(modelData.view), modelData.kind ? { kind: modelData.kind } : {}, true)
                   }
                 }
               }
 
               Item { width: 1; height: Style.spacing.sm }
 
+              // The catalogue follows the account's storefront, not the
+              // settings default, so only a signed-in account has one to show.
               Text {
                 width: parent.width
-                visible: root.service && root.service.settings && root.service.settings.storefront
+                visible: root.signedIn && root.storefront !== ""
                 textFormat: Text.PlainText
-                text: root.service && root.service.settings
-                      ? "Storefront: " + String(root.service.settings.storefront || "").toUpperCase() : ""
+                text: "Storefront: " + root.storefront.toUpperCase()
                 color: root.faint
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -566,7 +679,8 @@ Item {
                   Text {
                     width: parent.width
                     textFormat: Text.PlainText
-                    text: root.hasSong ? String(root.nowPlaying.title || "") : "Nothing playing"
+                    text: root.hasSong ? String(root.nowPlaying.title || "")
+                          : (root.connection === "unavailable" ? "Player unavailable" : "Nothing playing")
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -621,6 +735,8 @@ Item {
                   accent: root.accent
                   background: root.background
                   fontFamily: root.fontFamily
+                  // The window's own keys (keyCatcher above).
+                  keyHints: ({ previous: "←", next: "→", playPause: "Space" })
                   large: true
                 }
 
@@ -641,12 +757,29 @@ Item {
                   SeekBar {
                     Layout.fillWidth: true
                     Layout.alignment: Qt.AlignVCenter
+                    visible: !root.service || root.service.prepareMessage === ""
                     foreground: root.foreground
                     accent: root.accent
                     position: root.service ? root.service.position : 0
                     duration: root.service ? root.service.duration : 0
-                    enabled: root.hasSong
+                    enabled: root.service ? root.service.canSeek === true : false
                     onSeeked: function(position) { if (root.service) root.service.seek(position) }
+                  }
+
+                  // The picked track is still being fetched and decrypted:
+                  // the old file's progress would be a lie, so say so.
+                  Text {
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    visible: !!root.service && root.service.prepareMessage !== ""
+                    horizontalAlignment: Text.AlignHCenter
+                    textFormat: Text.PlainText
+                    text: root.service ? String(root.service.prepareMessage || "") : ""
+                    color: root.service && root.service.prepareFailed ? root.urgent : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                    renderType: Text.NativeRendering
                   }
 
                   Text {
@@ -674,26 +807,22 @@ Item {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: root.service && Number(root.service.player.volume) === 0 ? "󰖁" : "󰕾"
+                    text: root.service && root.service.volume === 0 ? "󰖁" : "󰕾"
                     color: root.dim
                     font.family: Style.font.family
                     font.pixelSize: Style.font.body
                     renderType: Text.NativeRendering
                     HoverHandler { cursorShape: Qt.PointingHandCursor }
-                    TapHandler {
-                      onTapped: {
-                        if (!root.service) return
-                        var current = Number(root.service.player.volume) || 0
-                        root.service.setVolume(current > 0 ? 0 : 70)
-                      }
-                    }
+                    // Same mute as the dropdown's: the daemon keeps the level
+                    // to come back to.
+                    TapHandler { onTapped: if (root.service) root.service.mute() }
                   }
 
                   SeekBar {
                     Layout.fillWidth: true
                     foreground: root.foreground
                     accent: root.accent
-                    position: root.service ? Number(root.service.player.volume) || 0 : 0
+                    position: root.service ? root.service.volume : 0
                     duration: 100
                     onSeeked: function(position) { if (root.service) root.service.setVolume(Math.round(position)) }
                   }
@@ -702,7 +831,7 @@ Item {
                     Layout.preferredWidth: Style.space(30)
                     horizontalAlignment: Text.AlignRight
                     textFormat: Text.PlainText
-                    text: root.service ? Math.round(Number(root.service.player.volume) || 0) + "%" : ""
+                    text: root.service ? root.service.volume + "%" : ""
                     color: root.faint
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall

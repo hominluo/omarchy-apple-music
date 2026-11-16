@@ -84,8 +84,8 @@ Item {
         number: index + 1
         current: index === root.currentIndex
         playing: index === root.currentIndex && root.service ? root.service.playing : false
-        stage: root.service && root.service.build && root.service.build[modelData.id]
-               ? String(root.service.build[modelData.id].stage || "") : ""
+        stage: root.service && root.service.buildStages && root.service.buildStages[modelData.id]
+               ? String(root.service.buildStages[modelData.id].stage || "") : ""
         foreground: root.foreground
         accent: root.accent
         onActivated: {

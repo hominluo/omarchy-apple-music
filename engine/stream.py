@@ -18,12 +18,14 @@ starts gaplessly: the next track is built while the current one plays.
 
 import asyncio
 import base64
+import functools
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urljoin
@@ -41,10 +43,123 @@ CODEC_FLAVORS = {
 }
 WIDEVINE_KEYFORMAT = "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
 SEGMENT_WORKERS = 6
+DEFAULT_CACHE_LIMIT_MB = 1024
+# Files build() returned in the last RECENT_SECONDS, {path: when}. The tracks
+# really in use come from the daemon (StreamBuilder.in_use); a count of recent
+# builds alone let the playing track drop out behind a second prefetch pass
+# (shuffle turned on with prefetch 10) and be pruned. This covers only the
+# moment between a build returning and the daemon's state naming the file
+# (mpv's load, the prefetch window moving on), so it is kept by age, not by
+# count: a dozen files kept by count made cacheLimitMb 0 mean "the tracks in
+# use and the last twelve built". Module-wide because build(), prune() and
+# clear_cache() all read it and a process has one cache-managing builder;
+# probe runs in its own process with manage_cache=False and never prunes.
+RECENT_SECONDS = 60.0
+_RECENT: dict[Path, float] = {}
+# Scratch folders of builds still running, or of cancelled builds whose ffmpeg
+# thread has not finished yet. Sweeping build/ leaves these alone.
+_ACTIVE_WORK: set[Path] = set()
+# _ACTIVE_WORK only knows this process's builds. A routine sweep leaves
+# anything younger than this alone, so a second process (`probe`, an old
+# launcher) never removes a folder another one is still writing; a build
+# lives at most about ffmpeg's 180 s plus ffprobe's 30 s.
+SWEEP_MIN_AGE = 15 * 60
 
 
 class StreamError(ApiError):
     pass
+
+
+def _remember(path: Path) -> None:
+    _RECENT[path] = time.monotonic()
+
+
+def _recent() -> set[Path]:
+    """The files built in the last RECENT_SECONDS; older entries go."""
+    cutoff = time.monotonic() - RECENT_SECONDS
+    for path, when in list(_RECENT.items()):
+        if when < cutoff:
+            del _RECENT[path]
+    return set(_RECENT)
+
+
+def cache_limit_mb() -> int:
+    """cacheLimitMb, read as written: 0 is a real answer (keep only the
+    tracks in use, see prune), not a missing one, and garbage means the
+    default."""
+    value = config.load_settings().get("cacheLimitMb", DEFAULT_CACHE_LIMIT_MB)
+    if isinstance(value, bool):
+        return DEFAULT_CACHE_LIMIT_MB
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return DEFAULT_CACHE_LIMIT_MB
+
+
+def work_dir() -> Path:
+    path = config.cache_dir() / "build"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _discard_work(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+    _ACTIVE_WORK.discard(path)
+
+
+def sweep_work_dir(min_age: float = SWEEP_MIN_AGE) -> int:
+    """Remove what failed or cancelled builds left in build/.
+
+    Each build works in its own folder and removes it, but a daemon that was
+    killed mid-build cannot, and older versions left loose files here. None of
+    it counts towards cacheLimitMb or shows in the cache stats, so it would
+    grow unseen. Folders of builds still running here are kept, and so is
+    anything younger than `min_age`, which may be another process's build.
+    Daemon startup and an explicit clear pass 0."""
+    removed = 0
+    try:
+        entries = list(work_dir().iterdir())
+    except OSError:
+        return 0
+    now = time.time()
+    for entry in entries:
+        if entry in _ACTIVE_WORK:
+            continue
+        if min_age > 0:
+            try:
+                if now - entry.lstat().st_mtime < min_age:
+                    continue
+            except OSError:
+                continue
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _readable_failure(error: BaseException) -> str:
+    """One line for the UI about a failed download or file step. CDN URLs
+    are signed, so they stay out of it."""
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        return f"Apple's server refused the download (HTTP {error.response.status_code})"
+    if isinstance(error, requests.Timeout):
+        return "The download timed out"
+    if isinstance(error, requests.ConnectionError):
+        return "Could not reach Apple's servers"
+    if isinstance(error, requests.RequestException):
+        return f"The download failed ({type(error).__name__})"
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "ffmpeg took too long with the track"
+    if isinstance(error, OSError):
+        detail = error.strerror or str(error)
+        name = os.path.basename(str(error.filename)) if error.filename else ""
+        return f"Could not prepare the track: {name + ': ' if name else ''}{detail}"
+    return str(error) or type(error).__name__
 
 
 class HlsInfo:
@@ -181,9 +296,15 @@ def _fetch(url: str, timeout: int = 30, offset: int | None = None,
 class StreamBuilder:
     """Builds playable files, one at a time per song."""
 
-    def __init__(self, api, notify=None):
+    def __init__(self, api, notify=None, in_use=None, manage_cache: bool = True):
         self.api = api
         self.notify = notify or (lambda *a, **k: None)
+        # A callable naming the song ids in use (the file mpv has, the queue
+        # position, the prefetch window); prune never deletes their files.
+        self.in_use = in_use
+        # False for a builder outside the daemon (probe): it builds its one
+        # file and leaves pruning and sweeping to the daemon that owns them.
+        self.manage_cache = manage_cache
         self._locks: dict[str, asyncio.Lock] = {}
         self._cdm = None
 
@@ -310,41 +431,67 @@ class StreamBuilder:
                 os.utime(target)
             except OSError:
                 pass
+            _remember(target)
             return target
         lock = self._lock(song_id)
         async with lock:
             if target.exists() and not force:
+                _remember(target)
                 return target
-            await self._progress(song_id, "resolving")
-            info = await self.resolve(song_id, bool(song.get("library")), codec)
+            try:
+                await self._build_locked(song, song_id, codec, target)
+            except ApiError:
+                raise
+            except (requests.RequestException, subprocess.TimeoutExpired, OSError) as error:
+                # The playlist and media fetches, the work files and the
+                # ffmpeg calls fail with library exceptions; as StreamError
+                # they take the daemon's failure path (mark the track failed,
+                # count it, move on) instead of stalling the queue.
+                raise StreamError(_readable_failure(error), code=(
+                    "network" if isinstance(error, requests.RequestException) else "io")) from error
+            _remember(target)
+            await self._progress(song_id, "ready")
+            if self.manage_cache:
+                self.prune(keep={target})
+            return target
 
-            await self._progress(song_id, "downloading", total=len(info.segments))
-            chunks = await self._download(info, song_id)
+    async def _build_locked(self, song: dict, song_id: str, codec: str, target: Path) -> None:
+        await self._progress(song_id, "resolving")
+        info = await self.resolve(song_id, bool(song.get("library")), codec)
 
-            await self._progress(song_id, "decrypting")
-            key = await self._key(info)
+        await self._progress(song_id, "downloading", total=len(info.segments))
+        chunks = await self._download(info, song_id)
 
-            workdir = config.cache_dir() / "build"
-            workdir.mkdir(parents=True, exist_ok=True)
-            encrypted = workdir / f"{song_id}.enc"
+        await self._progress(song_id, "decrypting")
+        key = await self._key(info)
+
+        # One folder per attempt, removed however the attempt ends. A cancel
+        # (skip, new queue) cannot stop the ffmpeg thread, so a fixed name
+        # would let that orphan write over a retry of the same song.
+        scratch = Path(tempfile.mkdtemp(dir=work_dir(), prefix=f"{target.stem}-"))
+        _ACTIVE_WORK.add(scratch)
+        worker = None
+        try:
+            encrypted = scratch / f"{target.stem}.enc"
             with open(encrypted, "wb") as handle:
                 for chunk in chunks:
                     handle.write(chunk)
                 del chunks
 
-            partial = workdir / f"{song_id}.m4a"
-            cover = await self._cover(song, workdir, song_id)
-            await asyncio.to_thread(self._decrypt, encrypted, partial, key, song, cover)
+            partial = scratch / f"{target.stem}.m4a"
+            cover = await self._cover(song, scratch, target.stem)
+            # Shielded so a cancel leaves the worker running to its end and
+            # the folder is removed after it, not under it.
+            worker = asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(self._decrypt, encrypted, partial, key, song, cover))
+            await asyncio.shield(worker)
             partial.replace(target)
-            for leftover in (encrypted, cover):
-                if leftover:
-                    try:
-                        leftover.unlink()
-                    except OSError:
-                        pass
-            await self._progress(song_id, "ready")
-            self.prune()
-            return target
+        finally:
+            if worker is not None and not worker.done():
+                worker.add_done_callback(
+                    lambda done: (done.cancelled() or done.exception(), _discard_work(scratch)))
+            else:
+                _discard_work(scratch)
 
     async def _cover(self, song: dict, workdir, song_id: str):
         url = str(song.get("artwork") or "")
@@ -445,34 +592,81 @@ class StreamBuilder:
             raise StreamError("Decrypted file is not readable audio")
 
     # -- housekeeping -----------------------------------------------------
-    def prune(self, limit_mb: int | None = None) -> None:
-        limit = (limit_mb if limit_mb is not None else
-                 int(config.load_settings().get("cacheLimitMb") or 1024))
-        files = sorted(config.audio_dir().glob("*.m4a"), key=lambda p: p.stat().st_mtime)
-        total = sum(p.stat().st_size for p in files)
-        budget = limit * 1024 * 1024
-        while files and total > budget:
-            victim = files.pop(0)
+    @staticmethod
+    def _audio_files() -> list[tuple[float, int, Path]]:
+        """(mtime, size, path) of every cached track, oldest first. A file can
+        vanish between the listing and the stat (clear cache, another prune),
+        which must not fail the build that happened to call prune."""
+        files = []
+        for path in config.audio_dir().glob("*.m4a"):
             try:
-                total -= victim.stat().st_size
-                victim.unlink()
+                info = path.stat()
+            except OSError:
+                continue
+            files.append((info.st_mtime, info.st_size, path))
+        files.sort(key=lambda item: item[0])
+        return files
+
+    def prune(self, limit_mb: int | None = None, keep=()) -> None:
+        """Delete the least recently used tracks until the cache fits.
+
+        The tracks in use are never chosen: the playing one, the queue
+        position and the prefetch window (the daemon's in_use), and any file
+        built in the last RECENT_SECONDS (otherwise a limit smaller than one
+        track hands mpv a path that is already gone). With a small limit the
+        cache may stay over it by those few files; 0 therefore means "keep
+        only the tracks in use", and a file kept only for being fresh goes at
+        the first prune after its minute is up."""
+        limit = cache_limit_mb() if limit_mb is None else max(0, int(limit_mb))
+        kept = {Path(path) for path in keep} | _recent() | self._paths_in_use()
+        files = self._audio_files()
+        total = sum(size for _, size, _ in files)
+        budget = limit * 1024 * 1024
+        for _, size, path in files:
+            if total <= budget:
+                break
+            if path in kept:
+                continue
+            try:
+                path.unlink()
+                total -= size
             except OSError:
                 pass
+        sweep_work_dir()
+
+    def _paths_in_use(self) -> set[Path]:
+        if self.in_use is None:
+            return set()
+        try:
+            return {self.cached_path(str(song_id)) for song_id in self.in_use() if song_id}
+        except Exception:  # noqa: BLE001 - a prune must never fail the build that ran it
+            log.warning("could not tell which tracks are in use", exc_info=True)
+            return set()
 
     def cache_stats(self) -> dict:
-        files = list(config.audio_dir().glob("*.m4a"))
+        files = self._audio_files()
         return {
             "tracks": len(files),
-            "bytes": sum(p.stat().st_size for p in files),
-            "limitMb": int(config.load_settings().get("cacheLimitMb") or 1024),
+            "bytes": sum(size for _, size, _ in files),
+            "limitMb": cache_limit_mb(),
         }
 
-    def clear_cache(self) -> dict:
+    def clear_cache(self, keep=()) -> dict:
+        """Empty the audio cache, except `keep` (the daemon passes the track
+        mpv is playing, so repeat and previous still find it), and sweep the
+        leftovers of failed builds."""
+        kept = {Path(path) for path in keep}
         removed = 0
         for path in config.audio_dir().glob("*"):
+            if path in kept:
+                continue
             try:
                 path.unlink()
                 removed += 1
             except OSError:
                 pass
+        removed += sweep_work_dir(min_age=0)
+        for path in list(_RECENT):
+            if path not in kept:
+                del _RECENT[path]
         return {"removed": removed}

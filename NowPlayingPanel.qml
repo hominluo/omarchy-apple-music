@@ -13,7 +13,11 @@ import "components"
 // full window. "Open Apple Music" is one row away when they do.
 //
 // Keyboard and mouse share one cursor (the CursorSurface contract): hovering
-// a row moves the cursor rather than painting its own highlight.
+// a row moves the cursor rather than painting its own highlight. Enter acts
+// on the cursor row; Space does too, but only when the keyboard put the
+// cursor there. A cursor the pointer left on the hero or volume row would
+// otherwise turn Space into "open the window" or "mute" instead of the
+// play/pause its tooltip promises.
 Panel {
   id: root
   moduleName: "io.github.hominluo.apple-music"
@@ -42,7 +46,9 @@ Panel {
   readonly property string artwork: service ? service.artwork : ""
   readonly property real position: service ? service.position : 0
   readonly property real duration: service ? service.duration : 0
-  readonly property int volume: service && service.player ? Math.round(Number(service.player.volume) || 0) : 0
+  readonly property bool canSeek: service ? service.canSeek === true : false
+  readonly property string prepareMessage: service ? String(service.prepareMessage || "") : ""
+  readonly property int volume: service ? Number(service.volume) || 0 : 0
   readonly property bool shuffleOn: service && service.queue ? service.queue.shuffle === true : false
   readonly property string repeatMode: service && service.queue ? String(service.queue.repeat || "off") : "off"
 
@@ -62,7 +68,6 @@ Panel {
 
   property string notice: ""
   property string noticeLevel: "info"
-  property int volumeBeforeMute: 100
 
   implicitWidth: 0
   implicitHeight: 0
@@ -71,9 +76,22 @@ Panel {
   property bool cursorActive: false
   property string focusSection: "hero"
   property int selectedIndex: 0
+  // Whether the keys (not the pointer) put the cursor where it is.
+  property bool cursorFromKeyboard: false
+  // PanelKeyCatcher emits returnRequested just before activateRequested for
+  // Enter and only activateRequested for Space; this tells them apart.
+  property bool returnPending: false
 
   readonly property var transportActions: ["shuffle", "previous", "playPause", "next", "repeat"]
-  readonly property var footerActions: ["open", "queue"]
+  // Sign in sits in the footer while the daemon says a sign-in is needed,
+  // so the caption under it is not the only thing the dropdown offers.
+  readonly property bool offerSignIn: connected && service ? service.needsSignIn === true : false
+  readonly property var footerActions: {
+    var list = ["open"]
+    if (root.offerSignIn) list.push("signIn")
+    if (root.queueRemaining > 0) list.push("queue")
+    return list
+  }
 
   readonly property var visibleSections: {
     var list = []
@@ -95,8 +113,11 @@ Panel {
     return section === "transport" || section === "footer" || section === "queue"
   }
 
+  // Pointer hover: shows the cursor on the hovered row without claiming it
+  // for Space (see cursorFromKeyboard).
   function setCursor(section, index) {
     cursorActive = true
+    cursorFromKeyboard = false
     focusSection = section
     selectedIndex = index
   }
@@ -134,9 +155,7 @@ Panel {
       case "transport": root.runTransport(transportActions[selectedIndex]); return
       case "volume": root.toggleMute(); return
       case "queue":
-        if (queueRows[selectedIndex]) service.jump(queueRows[selectedIndex].index !== undefined
-          ? queueRows[selectedIndex].index
-          : Math.max(0, service.queueIndex + 1 + selectedIndex))
+        if (queueRows[selectedIndex]) root.jumpToUpNext(selectedIndex)
         return
       case "footer": root.runFooter(footerActions[selectedIndex]); return
     }
@@ -153,30 +172,44 @@ Panel {
     }
   }
 
+  // Up Next rows are a slice of the queue starting after the current track,
+  // so a row's queue position is that start plus its row index. A track's own
+  // `index` field is its place on its album or playlist, which stops matching
+  // the queue as soon as it is shuffled.
+  function jumpToUpNext(row) {
+    if (!service) return
+    service.jump(Math.max(0, service.queueIndex + 1) + row)
+  }
+
   function runFooter(action) {
     if (action === "open") root.browse("")
     else if (action === "queue") root.browse("queue")
+    else if (action === "signIn") root.signIn()
+  }
+
+  function signIn() {
+    if (!service) return
+    service.signIn(function(ok, result) {
+      if (ok) root.showNotice("Finish signing in in the window that opened", "info")
+      else root.showNotice(result && result.message ? String(result.message) : "Could not open a sign-in window", "error")
+    })
   }
 
   function seekBy(seconds) {
-    if (!service) return
+    if (!service || !root.canSeek) return
     var target = Math.max(0, Math.min(root.duration || 0, root.position + seconds))
     service.seek(target)
   }
 
   function setVolume(value) {
     if (!service) return
-    service.setVolume(Math.max(0, Math.min(130, Math.round(value))))
+    service.setVolume(Math.max(0, Math.min(100, Math.round(value))))
   }
 
+  // The daemon keeps the level to restore, shared with the window and the
+  // other monitors' dropdowns.
   function toggleMute() {
-    if (!service) return
-    if (root.volume > 0) {
-      root.volumeBeforeMute = root.volume
-      root.setVolume(0)
-    } else {
-      root.setVolume(root.volumeBeforeMute > 0 ? root.volumeBeforeMute : 60)
-    }
+    if (service) service.mute()
   }
 
   function browse(view) {
@@ -212,11 +245,21 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      // Opening the dropdown is the user asking for the player: retry a
+      // daemon that is backing off now rather than in a minute.
+      if (service && typeof service.wake === "function") service.wake()
       cursorActive = false
+      cursorFromKeyboard = false
       focusSection = "hero"
       selectedIndex = 0
       Qt.callLater(function() { if (flick) flick.contentY = 0 })
     }
+  }
+
+  // Sign in and Up Next come and go, so the footer can shrink under the cursor.
+  onFooterActionsChanged: {
+    if (focusSection === "footer" && selectedIndex >= footerActions.length)
+      selectedIndex = Math.max(0, footerActions.length - 1)
   }
 
   onVisibleSectionsChanged: {
@@ -254,12 +297,20 @@ Panel {
       anchors.fill: parent
 
       onMoveRequested: function(dx, dy) {
+        // Arrows carry on from wherever the cursor is, hovered or not, and
+        // from then on Space acts on it.
+        root.cursorFromKeyboard = true
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
         else root.moveCursorH(dx)
       }
-      onActivateRequested: if (root.cursorActive) root.activateCursor()
-                            else if (root.service) root.service.toggle()
+      onReturnRequested: root.returnPending = true
+      onActivateRequested: {
+        var enter = root.returnPending
+        root.returnPending = false
+        if (root.cursorActive && (enter || root.cursorFromKeyboard)) root.activateCursor()
+        else if (root.service) root.service.toggle()
+      }
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
@@ -335,8 +386,12 @@ Panel {
                 Text {
                   width: parent.width
                   textFormat: Text.PlainText
-                  text: root.hasSong ? root.title
-                        : (root.connected ? "Nothing playing" : "Starting Apple Music…")
+                  text: {
+                    if (root.hasSong) return root.title
+                    if (root.connected) return "Nothing playing"
+                    if (root.service && root.service.connection === "unavailable") return "Apple Music is unavailable"
+                    return "Starting Apple Music…"
+                  }
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.subtitle
@@ -351,9 +406,14 @@ Panel {
                   width: parent.width
                   visible: text !== ""
                   textFormat: Text.PlainText
-                  text: root.hasSong
-                        ? (root.artist + (root.albumName !== "" ? "  ·  " + root.albumName : ""))
-                        : "Open the window to browse your library"
+                  text: {
+                    if (root.hasSong) return root.artist + (root.albumName !== "" ? "  ·  " + root.albumName : "")
+                    // Only an error Service has tied to this run: a leftover
+                    // from a previous one would sit under "Starting…".
+                    if (root.service && root.service.currentError)
+                      return String(root.service.currentError)
+                    return "Open the window to browse your library"
+                  }
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -404,11 +464,28 @@ Panel {
 
               SeekBar {
                 Layout.fillWidth: true
+                visible: root.prepareMessage === ""
                 foreground: root.foreground
                 accent: root.accent
                 position: root.position
                 duration: root.duration
+                enabled: root.canSeek
                 onSeeked: function(seconds) { if (root.service) root.service.seek(seconds) }
+              }
+
+              // While the new track is fetched and decrypted the bar would
+              // show the previous file's progress; say what is happening.
+              Text {
+                Layout.fillWidth: true
+                visible: root.prepareMessage !== ""
+                horizontalAlignment: Text.AlignHCenter
+                textFormat: Text.PlainText
+                text: root.prepareMessage
+                color: root.service && root.service.prepareFailed ? root.urgent : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                renderType: Text.NativeRendering
               }
 
               Text {
@@ -437,6 +514,8 @@ Panel {
               accent: root.accent
               background: Color.menu.background
               fontFamily: root.fontFamily
+              // The dropdown's own keys (see onTextKey).
+              keyHints: ({ previous: "p", next: "n", playPause: "Space", shuffle: "s", repeat: "r" })
               hasCursor: root.cursorActive && root.focusSection === "transport"
               cursorIndex: root.selectedIndex
               onHovered: function(index) { root.setCursor("transport", index) }
@@ -548,11 +627,7 @@ Panel {
                 number: Math.max(0, root.service ? root.service.queueIndex : 0) + index + 2
                 foreground: root.foreground
                 accent: root.accent
-                onActivated: {
-                  if (!root.service) return
-                  var start = Math.max(0, root.service.queueIndex + 1)
-                  root.service.jump(start + index)
-                }
+                onActivated: root.jumpToUpNext(index)
               }
             }
 
@@ -584,25 +659,41 @@ Panel {
                 Layout.minimumWidth: 0
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                hasCursor: root.cursorActive && root.focusSection === "footer" && root.selectedIndex === 0
+                hasCursor: root.cursorActive && root.focusSection === "footer"
+                           && root.footerActions[root.selectedIndex] === "open"
                 bordered: true
                 iconText: "󰋜"
                 text: "Open Apple Music"
                 tooltipText: "The full window  (o)"
-                onHovered: function(isHovered) { if (isHovered) root.setCursor("footer", 0) }
+                onHovered: function(isHovered) { if (isHovered) root.setCursor("footer", root.footerActions.indexOf("open")) }
                 onClicked: root.browse("")
+              }
+
+              Button {
+                visible: root.offerSignIn
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                hasCursor: root.cursorActive && root.focusSection === "footer"
+                           && root.footerActions[root.selectedIndex] === "signIn"
+                bordered: true
+                iconText: "󰍂"
+                text: root.service && root.service.authExpired ? "Sign in again" : "Sign in"
+                tooltipText: "Opens the Apple Music sign-in window"
+                onHovered: function(isHovered) { if (isHovered) root.setCursor("footer", root.footerActions.indexOf("signIn")) }
+                onClicked: root.signIn()
               }
 
               Button {
                 visible: root.queueRemaining > 0
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                hasCursor: root.cursorActive && root.focusSection === "footer" && root.selectedIndex === 1
+                hasCursor: root.cursorActive && root.focusSection === "footer"
+                           && root.footerActions[root.selectedIndex] === "queue"
                 bordered: true
                 iconText: "󰐑"
                 text: "Up Next"
                 tooltipText: "The full queue  (q)"
-                onHovered: function(isHovered) { if (isHovered) root.setCursor("footer", 1) }
+                onHovered: function(isHovered) { if (isHovered) root.setCursor("footer", root.footerActions.indexOf("queue")) }
                 onClicked: root.browse("queue")
               }
             }
@@ -613,11 +704,17 @@ Panel {
               textFormat: Text.PlainText
               text: {
                 if (root.notice !== "") return root.notice
-                if (root.service && !root.connected) return "Connecting to the player…"
-                if (root.service && root.service.auth && !root.service.auth.signedIn) return "Sign in from the window to start listening."
+                if (root.service && !root.connected) {
+                  if (root.service.connection === "unavailable") return "The player could not start. Open the window to try again."
+                  return root.service.connection === "starting" ? "Starting the player…" : "Connecting to the player…"
+                }
+                if (root.service && root.service.authExpired) return "Apple Music signed you out. Sign in again to keep listening."
+                if (root.service && !root.service.signedIn) return "Sign in to start listening."
                 return ""
               }
-              color: root.noticeLevel === "error" ? root.urgent : root.dim
+              color: root.noticeLevel === "error" || (root.notice === "" && root.service
+                     && (root.service.connection === "unavailable" || root.service.authExpired))
+                     ? root.urgent : root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap

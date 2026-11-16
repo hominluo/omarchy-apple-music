@@ -17,12 +17,26 @@ MPRIS.
 The bar cell is a now-playing dropdown, not just a launcher:
 
 - **Left click** — seek, transport, volume and Up Next without opening the
-  window. Hover or Tab into a row and Enter acts on it; `m` mutes, `n`/`p` skip,
-  `,`/`.` seek, `o` opens the window.
+  window.
 - **Right click** — the full window: Home, Browse, Search, your library, the
   queue, and sign-in.
 - **Middle click** — play/pause.
 - **Wheel** — volume, or seek, per the `wheelAction` setting.
+
+In the dropdown, the arrows or `h`/`j`/`k`/`l` move a cursor over the rows and
+Enter acts on the row under it. Space plays/pauses, unless you moved the
+cursor with the keyboard, in which case it acts on that row. `m` mutes, `n`/`p`
+skip, `,`/`.` seek ten seconds, `s` shuffles, `r` cycles repeat, `o` opens the
+window and `q` opens the queue in it. Tab moves to the next bar dropdown and
+Escape closes.
+
+In the window, Space plays/pauses, `←`/`→` skip, `/` goes to Search and `q`
+to the queue (all of them stay out of the way while you type in the search
+field). Escape goes back a view; on the first view it closes the window. In
+Search, the first Escape clears the field.
+
+`omarchy-shell io.github.hominluo.apple-music.panel toggle` opens the dropdown
+on the focused monitor, for a keybinding.
 
 ![The now-playing dropdown under the bar icon](docs/dropdown.png)
 
@@ -34,6 +48,16 @@ back to just the music note.
 In the window, the cover in the footer opens the album that is playing and the
 artist line opens the artist, so a song heard somewhere can be followed back to
 its record without a search.
+
+A track that is not in the cache yet is downloaded and decrypted before it
+plays. Meanwhile its title shows with "Preparing…" and the step it is on, and
+seeking waits until it is loaded. If it cannot be built, it shows as
+unavailable with the reason and the queue moves on.
+
+Your library loads a page at a time: scroll to the end, or press Load more.
+Playing a song from it queues the songs loaded so far. Very long playlists and
+artist discographies are cut off at what the player fetches, and the page
+says so.
 
 ## Shape
 
@@ -78,11 +102,19 @@ omarchy plugin add https://github.com/hominluo/omarchy-apple-music --enable
 ```
 
 Add **Apple Music** from the widget picker if it is not in the bar yet. The
-daemon starts with the service; once it is up, this answers `pong`:
+daemon starts with the service; `status` shows whether the player is
+connected:
 
 ```sh
-omarchy-shell io.github.hominluo.apple-music ping
+omarchy-shell io.github.hominluo.apple-music status
 ```
+
+The first start builds the private venv, which takes a little while. If the
+daemon cannot start (no `mpv`, a broken venv, a pip failure), the bar tooltip,
+the dropdown and the window header say "unavailable" with the reason, which is
+also written to `engine.log`. The service then retries a few times and after
+that once a minute; opening the window or the dropdown, or pressing play,
+retries at once.
 
 ### The one manual step: the Widevine device
 
@@ -110,9 +142,20 @@ omarchy plugin remove io.github.hominluo.apple-music
 rm -rf ~/.local/share/omarchy-apple-music ~/.cache/omarchy/apple-music
 ```
 
-The daemon and mpv exit with the service; `pkill -f apple-musicd` is the
-fallback if the shell was killed on top of them. Settings, cache and the
-sign-in profile live only in the two directories above.
+Disabling or removing the plugin (`plugin remove` disables it first) stops
+the daemon and mpv. The daemon runs only while the shell's config,
+`~/.config/omarchy/shell.json`, has the plugin enabled by the shell's own
+rule: its id is not in `disabledPlugins`, and it sits in the bar layout or in
+`plugins`. The daemon checks that before it starts mpv and again whenever the
+file changes, so a disable lands within a few seconds, also while the daemon
+is still starting or after the shell was killed. A missing, half-written or
+unversioned file counts as enabled, so saving the config never stops the
+music. Deleting the plugin's folder by hand stops it too. A shell
+restart or hot-reload leaves the file alone: the music keeps playing and the
+new shell reconnects. After a plugin update the shell finds the daemon from
+the old release still running and replaces it once, so playback stops and
+the new engine starts. Settings, cache and the sign-in profile live only in
+the two directories above.
 
 ## Footprint
 
@@ -135,14 +178,30 @@ No Electron, no Chromium, no Node.
 ## Sign-in
 
 Signing in is a real window, not a token field. The plugin opens
-`music.apple.com` in a dedicated Chrome profile
-(`~/.local/share/omarchy-apple-music/chrome`), you log in there once, and the
-daemon keeps the `media-user-token` (mode 0600) for later API and licence
-calls. The window closes itself when it has the token.
+`music.apple.com` with the first Chrome, Chromium, Brave or Edge it finds, in a
+dedicated profile of its own (`~/.local/share/omarchy-apple-music/chrome`).
+You log in there once, and the daemon keeps the `media-user-token` (mode 0600)
+for later API and licence calls. The browser closes itself as soon as the
+daemon has a token Apple accepts. It also closes when sign-in is cancelled, and
+after ten minutes.
 
-The token is read from the profile's cookie database and, if Chrome has not
-flushed yet, from the live page over the DevTools port. Signing out deletes the
-stored token; the profile is left in place.
+The token is read from the live page over a DevTools port that listens on
+loopback only and exists only while that window is open, and, once the browser
+has written it, from the profile's cookie database.
+
+When there is no stored token, the daemon looks for an existing Apple Music
+session cookie when it starts: first in the plugin's own profile, then in your
+Chrome, Chromium, Brave and Edge profiles (Default and every `Profile N`). It
+reads only the `media-user-token` cookie, using that browser's keyring secret
+when the cookie is encrypted. So if you already use Apple Music in one of those
+browsers, you are signed in without doing anything.
+
+If Apple stops accepting the token mid-session, the window and the dropdown
+say so and offer Sign in again. Sign out (in the window header, also while the
+token is rejected; press it twice to confirm) deletes the stored token, and the Apple cookies and site storage
+in the plugin's own profile. Your daily browsers are left alone. Sign out
+sticks: the daemon stops searching for a session at startup until you sign in
+again yourself.
 
 ## Widevine device
 
@@ -158,10 +217,25 @@ $XDG_DATA_HOME/omarchy-apple-music/    account.json, chrome/, venv/, settings.js
 $XDG_CACHE_HOME/omarchy/apple-music/   audio/, artwork/, engine.log
 ```
 
-`settings.json` holds `storefront`, `language`, `codec`, `prefetch` (tracks
-resolved ahead), `cacheLimitMb` (default 1024) and `volume` (0–130, the level
-the player comes back at). Old audio is pruned when the cache is over the limit;
-the daemon never deletes the track that is playing.
+`settings.json` holds:
+
+- `storefront`: only a fallback until the account is known; the catalogue
+  follows your subscription's storefront, which the window's sidebar shows.
+- `language` and `codec`.
+- `prefetch`: tracks built ahead of the one playing; 0 turns it off.
+- `volume`: 0–100, the level the player comes back at after a restart. A
+  saved 0 stays muted.
+- `muteRestore`: the level unmute goes back to. Mute (`m` in the dropdown, or
+  the speaker icon) saves the current level here, so unmuting works after a
+  restart too.
+- `cacheLimitMb`: default 1024. After each new track is built, the oldest
+  audio is deleted until the cache fits. The tracks in use (the one playing,
+  the ones prefetched, and any built in the last minute) are never deleted,
+  so the cache can go over the limit by those few files, and 0 means "keep
+  only those".
+
+`apple-musicd.py call clearCache` empties the audio cache but keeps the track
+that is playing.
 
 ## IPC
 
@@ -169,12 +243,18 @@ the daemon never deletes the track that is playing.
 omarchy-shell io.github.hominluo.apple-music status
 omarchy-shell io.github.hominluo.apple-music playPause
 omarchy-shell io.github.hominluo.apple-music next
+omarchy-shell io.github.hominluo.apple-music mute
+omarchy-shell io.github.hominluo.apple-music volume 40
 omarchy-shell io.github.hominluo.apple-music openView album '{"id":"1441133277","library":false}'
 ```
 
 The daemon itself speaks NDJSON on `$XDG_RUNTIME_DIR/omarchy-apple-music/daemon.sock`
 (`{id, cmd, params}` in, `{id, ok, result}` out, plus unsolicited
-`snapshot`/`player`/`nowPlaying`/`queue`/`auth`/`build` events).
+`snapshot`/`player`/`nowPlaying`/`queue`/`auth`/`build`/`settings`/`engine`
+events and `notice` messages). Replies can come back out of order, so match
+them by `id`. `apple-musicd.py call <command>` sends one command by hand;
+`call quit` stops the daemon and mpv, though the service starts them again
+while the plugin is enabled.
 `apple-musicd.py probe <song id>` runs the whole chain for one track and prints
 the decoded file, which is the quickest way to tell a catalogue problem from a
 decryption one.
@@ -183,7 +263,7 @@ decryption one.
 
 - Apple's private web-playback endpoint and the licence exchange are
   undocumented and can change without notice.
-- One account, one storefront (from the token). No lyrics, video, radio or
+- One account, one storefront (your subscription's). No lyrics, video, radio or
   lossless.
 - Library playlists have no artwork of their own; the first track's cover is
   shown instead.

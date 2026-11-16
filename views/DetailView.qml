@@ -27,6 +27,9 @@ Item {
     return ""
   }
   property var albums: []
+  // The engine stops paging a very long playlist (or an artist's albums)
+  // at a cap and says so; the list on screen is then not the whole thing.
+  property bool truncated: false
   property bool loading: false
   property string error: ""
 
@@ -46,6 +49,7 @@ Item {
     root.info = null
     root.tracks = []
     root.albums = []
+    root.truncated = false
     var done = function(ok, result) {
       if (token !== root.loadToken) return
       // The Loader keeps this item alive when only the id changes, so the
@@ -53,6 +57,7 @@ Item {
       scroll.contentY = 0
       root.loading = false
       if (!ok) { root.error = result && result.message ? String(result.message) : "Could not load"; return }
+      root.truncated = result.truncated === true
       if (root.kind === "artist") {
         root.info = result.info || null
         root.albums = result.albums || []
@@ -153,19 +158,36 @@ Item {
             if (!root.info) return ""
             if (root.kind === "artist") {
               var count = root.albums.length || 0
-              return count === 1 ? "1 album" : count + " albums"
+              return count === 1 ? "1 album" : count + (root.truncated ? "+ albums" : " albums")
             }
             var parts = []
             if (root.info.artist) parts.push(String(root.info.artist))
             if (root.info.year) parts.push(String(root.info.year))
             var trackCount = root.kind === "playlist" ? (root.tracks.length || 0) : Number(root.info.trackCount || 0)
-            if (trackCount > 0) parts.push(trackCount === 1 ? "1 track" : trackCount + " tracks")
+            if (trackCount > 0)
+              parts.push(trackCount === 1 ? "1 track" : trackCount + (root.truncated && root.kind === "playlist" ? "+ tracks" : " tracks"))
             return parts.join("  ·  ")
           }
           color: Util.alpha(root.foreground, 0.6)
           font.family: Style.font.family
           font.pixelSize: Style.font.body
           renderType: Text.NativeRendering
+          elide: Text.ElideRight
+        }
+
+        Text {
+          width: parent.width
+          visible: root.truncated
+          textFormat: Text.PlainText
+          text: root.kind === "artist"
+                ? "Showing the first " + root.albums.length + " albums; Apple has more than the player fetches."
+                : "Showing the first " + root.tracks.length + " tracks; the rest are not loaded, so Play stops there."
+          color: Util.alpha(root.foreground, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          renderType: Text.NativeRendering
+          wrapMode: Text.WordWrap
+          maximumLineCount: 2
           elide: Text.ElideRight
         }
 
@@ -225,8 +247,8 @@ Item {
                  ? String(root.service.nowPlaying.id) === String(modelData.id) : false
         playing: root.service && root.service.nowPlaying
                  ? String(root.service.nowPlaying.id) === String(modelData.id) && root.service.playing : false
-        stage: root.service && root.service.build && root.service.build[modelData.id]
-               ? String(root.service.build[modelData.id].stage || "") : ""
+        stage: root.service && root.service.buildStages && root.service.buildStages[modelData.id]
+               ? String(root.service.buildStages[modelData.id].stage || "") : ""
         onActivated: root.playTracks(root.tracks, index, {
           title: root.info ? String(root.info.title || "") : "",
           artwork: root.artwork

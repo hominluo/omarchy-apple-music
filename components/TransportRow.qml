@@ -19,11 +19,16 @@ Item {
   property bool large: false
   property bool hasCursor: false
   property int cursorIndex: 0
+  // The key each action answers to where this row is shown, by action name.
+  // Each host passes its own: the window and the dropdown bind different
+  // keys, and a tooltip must never advertise a key its surface ignores.
+  property var keyHints: ({})
 
   signal hovered(int index)
 
   readonly property bool hasSong: service ? service.hasSong : false
   readonly property bool playing: service ? service.playing : false
+  readonly property bool preparing: service ? service.preparing === true : false
   readonly property bool shuffleOn: service && service.queue ? service.queue.shuffle === true : false
   readonly property string repeatMode: service && service.queue ? String(service.queue.repeat || "off") : "off"
   readonly property var actions: ["shuffle", "previous", "playPause", "next", "repeat"]
@@ -48,6 +53,11 @@ Item {
   }
 
   function runIndex(index) { run(actions[index]) }
+
+  function withHint(label, action) {
+    var key = root.keyHints ? root.keyHints[action] : undefined
+    return key ? label + "  (" + key + ")" : label
+  }
 
   function repeatLabel() {
     if (root.repeatMode === "one") return "Repeat: this track"
@@ -89,16 +99,19 @@ Item {
         iconText: {
           if (modelData === "shuffle") return "󰒝"
           if (modelData === "previous") return "󰒮"
-          if (modelData === "playPause") return root.playing ? "󰏤" : "󰐊"
+          // An hourglass while the picked track is still being prepared:
+          // neither play nor pause describes that.
+          if (modelData === "playPause") return root.preparing ? "󰔟" : (root.playing ? "󰏤" : "󰐊")
           if (modelData === "next") return "󰒭"
           return root.repeatMode === "one" ? "󰑘" : "󰑖"
         }
         tooltipText: {
-          if (modelData === "shuffle") return root.shuffleOn ? "Shuffle: on" : "Shuffle: off"
-          if (modelData === "previous") return "Previous  (←)"
-          if (modelData === "playPause") return root.playing ? "Pause  (Space)" : "Play  (Space)"
-          if (modelData === "next") return "Next  (→)"
-          return root.repeatLabel()
+          if (modelData === "shuffle") return root.withHint(root.shuffleOn ? "Shuffle: on" : "Shuffle: off", "shuffle")
+          if (modelData === "previous") return root.withHint("Previous", "previous")
+          if (modelData === "playPause")
+            return root.preparing ? "Preparing…" : root.withHint(root.playing ? "Pause" : "Play", "playPause")
+          if (modelData === "next") return root.withHint("Next", "next")
+          return root.withHint(root.repeatLabel(), "repeat")
         }
 
         // The play control is a filled circle, not a theme pill: keep its

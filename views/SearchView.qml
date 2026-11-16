@@ -36,13 +36,25 @@ Item {
     if (root.visible) { field.forceActiveFocus(); field.selectAll() }
   })
 
+  // The daemon answers searches in the order they finish, not the order they
+  // were typed, so each run takes a token and only the newest answer counts.
+  // Clearing the field takes one too, which drops a reply still on its way.
+  property int searchToken: 0
+
   function run() {
     if (!root.service) return
     var text = root.term.trim()
-    if (text === "") { root.results = ({ songs: [], albums: [], artists: [], playlists: [] }); return }
+    var token = ++root.searchToken
+    if (text === "") {
+      root.loading = false
+      root.error = ""
+      root.results = ({ songs: [], albums: [], artists: [], playlists: [] })
+      return
+    }
     root.loading = true
     root.error = ""
     root.service.search(text, function(ok, result) {
+      if (token !== root.searchToken) return
       root.loading = false
       if (!ok) { root.error = result && result.message ? String(result.message) : "Search failed"; return }
       root.results = result || ({ songs: [], albums: [], artists: [], playlists: [] })
@@ -56,7 +68,13 @@ Item {
     onTriggered: root.run()
   }
 
-  onTermChanged: debounce.restart()
+  // An emptied field (Escape, or deleting the text) clears at once rather
+  // than after the debounce, so a reply landing in between cannot refill
+  // the list under it.
+  onTermChanged: {
+    if (root.term.trim() === "") { debounce.stop(); root.run() }
+    else debounce.restart()
+  }
 
   Column {
     anchors.fill: parent
@@ -71,7 +89,18 @@ Item {
       accent: root.accent
       onTextChanged: root.term = text
       onAccepted: { debounce.stop(); root.run() }
-      Keys.onEscapePressed: root.term = ""
+      // The first Escape clears the field; with nothing left to clear it
+      // goes on to the window, which walks back or closes. Accepting it
+      // unconditionally trapped a keyboard user in Search.
+      Keys.onEscapePressed: function(event) {
+        if (field.text !== "" || root.term !== "") {
+          field.text = ""
+          root.term = ""
+          event.accepted = true
+        } else {
+          event.accepted = false
+        }
+      }
     }
 
     Text {
