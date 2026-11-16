@@ -240,6 +240,9 @@ DEFAULT_SETTINGS = {
     "language": "en-US",
     "codec": "aac-web",       # 256 kbps AAC, the web player's default asset
     "prefetch": 2,             # tracks resolved ahead of the queue position
+    # Off: startup only looks in the plugin's own sign-in profile. On: it
+    # also reads the media-user-token from Chrome, Chromium, Brave and Edge.
+    "importBrowserCookies": False,
     "cacheLimitMb": 1024,
     "volume": 100,
     "muteRestore": 70,         # the level unmute returns to; written by mute

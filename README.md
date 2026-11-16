@@ -190,11 +190,13 @@ loopback only and exists only while that window is open, and, once the browser
 has written it, from the profile's cookie database.
 
 When there is no stored token, the daemon looks for an existing Apple Music
-session cookie when it starts: first in the plugin's own profile, then in your
-Chrome, Chromium, Brave and Edge profiles (Default and every `Profile N`). It
-reads only the `media-user-token` cookie, using that browser's keyring secret
-when the cookie is encrypted. So if you already use Apple Music in one of those
-browsers, you are signed in without doing anything.
+session cookie when it starts. By default it reads only the plugin's own
+profile; set `importBrowserCookies` to `true` in `settings.json` (and restart
+the daemon) to also read your Chrome, Chromium, Brave and Edge profiles
+(Default and every `Profile N`). That import reads only the
+`media-user-token` cookie, using that browser's keyring secret when the cookie
+is encrypted. So if you already use Apple Music in one of those browsers,
+opting in signs you in without doing anything.
 
 If Apple stops accepting the token mid-session, the window and the dropdown
 say so and offer Sign in again. Sign out (in the window header, also while the
@@ -222,6 +224,10 @@ $XDG_CACHE_HOME/omarchy/apple-music/   audio/, artwork/, engine.log
 - `storefront`: only a fallback until the account is known; the catalogue
   follows your subscription's storefront, which the window's sidebar shows.
 - `language` and `codec`.
+- `importBrowserCookies`: default `false`. When `true`, startup discovery
+  also reads the `media-user-token` from your daily Chrome, Chromium, Brave
+  and Edge profiles, not just the plugin's own profile. Restart the daemon
+  after changing it.
 - `prefetch`: tracks built ahead of the one playing; 0 turns it off.
 - `volume`: 0–100, the level the player comes back at after a restart. A
   saved 0 stays muted.

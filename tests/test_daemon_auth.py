@@ -108,10 +108,21 @@ class Startup(AuthDaemonCase):
 
     async def test_without_the_flag_a_session_is_discovered(self):
         d = self.daemon()
-        with mock.patch.object(auth, "discover", return_value=(Path("/p"), "FOUND")), \
+        self.assertFalse(d.settings["importBrowserCookies"])
+        with mock.patch.object(auth, "discover", return_value=(Path("/p"), "FOUND")) as discover, \
                 self.fetch({"FOUND": ACCOUNT_GB}):
             self.assertTrue(await d._refresh_api())
+        discover.assert_called_once_with(browsers=False)
         self.assertTrue(d.auth_state()["signedIn"])
+        self.assertEqual(auth.load()["mediaUserToken"], "FOUND")
+
+    async def test_the_browser_import_is_opt_in(self):
+        config.save_settings({"importBrowserCookies": True})
+        d = self.daemon()
+        with mock.patch.object(auth, "discover", return_value=(Path("/p"), "FOUND")) as discover, \
+                self.fetch({"FOUND": ACCOUNT_GB}):
+            self.assertTrue(await d._refresh_api())
+        discover.assert_called_once_with(browsers=True)
         self.assertEqual(auth.load()["mediaUserToken"], "FOUND")
 
     async def test_a_401_user_token_is_a_dead_session(self):

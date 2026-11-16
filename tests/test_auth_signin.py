@@ -383,11 +383,24 @@ class DailyBrowsers(AuthCase):
         finally:
             self.find.start()
 
-    def test_discover_reads_a_brave_profile(self):
+    def test_discover_reads_the_plugins_own_profile_by_default(self):
+        make_cookie_db(config.login_profile() / "Default" / "Cookies",
+                       [(".music.apple.com", auth.COOKIE_NAME, "OWN", 0)])
+        profile, token = auth.discover()
+        self.assertEqual(token, "OWN")
+        self.assertEqual(profile, config.login_profile())
+
+    def test_discover_ignores_daily_browsers_by_default(self):
         home = Path(os.environ["HOME"])
         make_cookie_db(home / ".config" / "BraveSoftware" / "Brave-Browser" / "Default" / "Cookies",
                        [(".music.apple.com", auth.COOKIE_NAME, "BRAVE", 0)])
-        profile, token = auth.discover()
+        self.assertIsNone(auth.discover())
+
+    def test_discover_opt_in_reads_a_brave_profile(self):
+        home = Path(os.environ["HOME"])
+        make_cookie_db(home / ".config" / "BraveSoftware" / "Brave-Browser" / "Default" / "Cookies",
+                       [(".music.apple.com", auth.COOKIE_NAME, "BRAVE", 0)])
+        profile, token = auth.discover(browsers=True)
         self.assertEqual(token, "BRAVE")
         self.assertIn("BraveSoftware", str(profile))
 

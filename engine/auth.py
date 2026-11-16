@@ -277,15 +277,18 @@ def _daily_profiles() -> list[tuple[Path, tuple[str, ...]]]:
     return found
 
 
-def discover() -> tuple[Path, str] | None:
+def discover(browsers: bool = False) -> tuple[Path, str] | None:
     """Any profile on this machine that already holds an Apple Music session.
 
-    The plugin's own profile is checked first, then the daily browsers
-    (Chrome, Chromium, Brave, Edge), so a user who has signed in anywhere
-    does not have to do it twice. The daemon does not call this after an
+    The plugin's own profile is always checked. The daily browsers (Chrome,
+    Chromium, Brave, Edge) are only read when `browsers` is set: another
+    application's cookie database is opt-in, turned on with the
+    ``importBrowserCookies`` setting. The daemon does not call this after an
     explicit sign-out.
     """
-    candidates = [(config.login_profile(), ())] + _daily_profiles()
+    candidates = [(config.login_profile(), ())]
+    if browsers:
+        candidates += _daily_profiles()
     for profile, keyring in candidates:
         try:
             token = read_profile_token(profile, keyring=keyring)

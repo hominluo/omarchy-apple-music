@@ -214,7 +214,10 @@ class Daemon:
         # the plugin's profile or a daily browser) is not picked up again;
         # only a sign-in clears that.
         if not token and not auth.signed_out(self.account_record):
-            found = await asyncio.to_thread(auth.discover)
+            found = await asyncio.to_thread(
+                auth.discover,
+                browsers=bool(self.settings.get("importBrowserCookies")),
+            )
             if self._session_gen != generation:
                 return False  # signed in or out meanwhile: that record stands
             if found:
